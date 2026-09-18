@@ -41,14 +41,21 @@ fn main() -> eframe::Result {
     }
     let preload: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([880.0, 690.0])
+        .with_min_inner_size([560.0, 520.0])
+        .with_drag_and_drop(true)
+        .with_title("HMI Log Converter");
+
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 690.0])
-            .with_min_inner_size([560.0, 520.0])
-            .with_drag_and_drop(true)
-            .with_title("HMI Log Converter"),
+        viewport,
         ..Default::default()
     };
+
     eframe::run_native(
         "HMI Log Converter",
         options,

@@ -2,6 +2,7 @@
 name = "hmi-converter"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 eframe = "0.36.2"
@@ -9,3 +10,14 @@ egui = "0.36.2"
 egui_plot = "0.37.0"
 rfd = "0.17.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"         # Optimize for smallest binary size
+lto = true              # Link-Time Optimization across crates
+codegen-units = 1       # Single code unit enables aggressive de-duplication
+panic = "abort"         # Removes stack-unwind tables
+strip = true            # Automatically strips all debug symbols
