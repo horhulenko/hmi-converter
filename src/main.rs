@@ -5,6 +5,7 @@
 //! works out by itself which one is which.
 
 mod convert;
+mod theme;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,28 +14,27 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use convert::{Job, Kept, Probe, Progress, Range, Summary};
+use eframe::egui;
+use theme::{ACCENT, BAD, DIM, MUTED, OK, TEXT, WARN, body, dot, lead, muted, strong};
 
 /// A counting request answered on a worker thread: which request, and its result.
 type CountReply = (u64, Result<Kept, String>);
-use eframe::egui;
-
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4D, 0xA3, 0xFF);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x4C, 0xC7, 0x8C);
-const WARN: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xB3, 0x39);
-const BAD: egui::Color32 = egui::Color32::from_rgb(0xE8, 0x6B, 0x6B);
-const MUTED: egui::Color32 = egui::Color32::from_gray(0x9A);
 
 fn main() -> eframe::Result {
-    // Given file names on the command line, convert without opening a window.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
+    // File names on the command line convert without opening a window, unless
+    // --gui asks for the window with those files already loaded.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let windowed = args.iter().any(|a| a == "--gui");
+    args.retain(|a| a != "--gui");
+    if !args.is_empty() && !windowed {
         std::process::exit(cli(&args));
     }
+    let preload: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 620.0])
-            .with_min_inner_size([580.0, 540.0])
+            .with_inner_size([700.0, 812.0])
+            .with_min_inner_size([560.0, 520.0])
             .with_drag_and_drop(true)
             .with_title("HMI Log Converter"),
         ..Default::default()
@@ -42,13 +42,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "HMI Log Converter",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, preload)))),
     )
 }
 
 // ---------------------------------------------------------------- settings
 
-/// The last time range the user actually converted, kept between sessions.
+/// What the user chose last time, kept between sessions.
 #[derive(Clone, Default)]
 struct Settings {
     from: String,
@@ -96,11 +96,13 @@ impl Settings {
 
 // ---------------------------------------------------------------- headless
 
-/// Batch mode: `hmi-converter Tags.db3 Values.db3 [-o FOLDER] [--semicolon]`.
+/// Batch mode: `hmi-converter Tags.db3 Values.db3 [options]`.
 fn cli(args: &[String]) -> i32 {
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
+    let mut base_name: Option<String> = None;
     let mut semicolon = false;
+    let mut shorten_names = false;
     let (mut write_long, mut write_wide) = (true, true);
     let mut range = Range::default();
 
@@ -112,20 +114,30 @@ fn cli(args: &[String]) -> i32 {
                 println!();
                 println!("Options:");
                 println!("  -o, --out FOLDER   where to write the CSV files");
+                println!("  -n, --name PREFIX  name of the files, before _long / _wide");
                 println!("  --from WHEN        ignore entries before this date/time");
                 println!("  --until WHEN       ignore entries after this date/time");
+                println!("  --short-names      shorten tag names to the telling part");
                 println!("  --semicolon        use ; instead of , as separator");
                 println!("  --long-only        write only the long table");
                 println!("  --wide-only        write only the wide table");
+                println!("  --gui              open the window with these files loaded");
                 println!();
-                println!("WHEN looks like 2026-09-18 or \"2026-09-18 06:30\" (UTC).");
+                println!("WHEN looks like 18.09.2026 or \"18.09.2026 06:30\" (UTC).");
                 println!("Start without arguments to open the window.");
                 return 0;
             }
             "-o" | "--out" => match it.next() {
                 Some(d) => out_dir = Some(PathBuf::from(d)),
                 None => {
-                    eprintln!("-o needs a folder");
+                    eprintln!("{a} needs a folder");
+                    return 2;
+                }
+            },
+            "-n" | "--name" => match it.next() {
+                Some(n) => base_name = Some(n.clone()),
+                None => {
+                    eprintln!("{a} needs a file name");
                     return 2;
                 }
             },
@@ -141,11 +153,12 @@ fn cli(args: &[String]) -> i32 {
                         }
                     },
                     None => {
-                        eprintln!("{a} needs a date, for example 2026-09-18");
+                        eprintln!("{a} needs a date, for example 18.09.2026");
                         return 2;
                     }
                 }
             }
+            "--short-names" => shorten_names = true,
             "--semicolon" => semicolon = true,
             "--long-only" => write_wide = false,
             "--wide-only" => write_long = false,
@@ -179,16 +192,14 @@ fn cli(args: &[String]) -> i32 {
         out_dir: out_dir
             .or_else(|| values.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from(".")),
-        base_name: values
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "hmi".into()),
+        base_name: base_name.unwrap_or_else(|| stem_of(&values)),
         tags_db: tags,
         values_db: values,
         semicolon,
         write_long,
         write_wide,
         range,
+        shorten_names,
     };
 
     let (tx, rx) = channel();
@@ -260,16 +271,20 @@ struct App {
     values: Option<Probe>,
     /// Feedback about the files that were just handed over.
     notes: Vec<(String, egui::Color32)>,
+    state: State,
+
+    // -- output
     out_dir: Option<PathBuf>,
+    base_name: Option<String>,
     semicolon: bool,
     write_long: bool,
     write_wide: bool,
-    state: State,
+    shorten_names: bool,
 
     // -- time range
     from_text: String,
     until_text: String,
-    /// The range used the last time something was converted, from the settings file.
+    /// The range used the last time something was converted.
     last: Settings,
     preview: Preview,
     /// What the preview was computed for, so it is only recomputed when it changes.
@@ -282,20 +297,19 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            s.spacing.button_padding = egui::vec2(12.0, 7.0);
-        });
-        Self {
+    fn new(cc: &eframe::CreationContext<'_>, preload: Vec<PathBuf>) -> Self {
+        theme::apply(&cc.egui_ctx);
+        let mut app = Self {
             tags: None,
             values: None,
             notes: Vec::new(),
+            state: State::Setup,
             out_dir: None,
+            base_name: None,
             semicolon: false,
             write_long: true,
             write_wide: true,
-            state: State::Setup,
+            shorten_names: false,
             from_text: String::new(),
             until_text: String::new(),
             last: Settings::load(),
@@ -305,7 +319,11 @@ impl App {
             pending_since: std::time::Instant::now(),
             counter: channel(),
             counter_gen: 0,
+        };
+        if !preload.is_empty() {
+            app.accept(preload);
         }
+        app
     }
 
     /// The chosen window, plus a message for whatever does not parse.
@@ -326,6 +344,42 @@ impl App {
             return Err("From is later than Until".into());
         }
         Ok(Range { from, until })
+    }
+
+    /// Where the files go, and what they are called.
+    fn out_dir(&self) -> PathBuf {
+        self.chosen_dir().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The folder as far as it is known: either the one picked, or the one the
+    /// value database sits in.
+    fn chosen_dir(&self) -> Option<PathBuf> {
+        self.out_dir
+            .clone()
+            .or_else(|| self.values.as_ref()?.path.parent().map(|p| p.to_path_buf()))
+    }
+
+    fn base_name(&self) -> String {
+        self.base_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| match &self.values {
+                Some(v) => stem_of(&v.path),
+                None => "hmi".into(),
+            })
+    }
+
+    /// The files that pressing Convert would write.
+    fn output_files(&self) -> Vec<String> {
+        let base = self.base_name();
+        let mut out = Vec::new();
+        if self.write_long {
+            out.push(format!("{base}_long.csv"));
+        }
+        if self.write_wide {
+            out.push(format!("{base}_wide.csv"));
+        }
+        out
     }
 
     fn ready(&self) -> bool {
@@ -434,79 +488,79 @@ impl App {
             }
         }
 
-        if files.is_empty() {
-            self.note("Nothing usable in there.", BAD);
-            return;
-        }
-
-        // Journal files belong to a database, they are never dropped on their own.
+        // Journal files belong to a database, they are never opened on their own.
         files.retain(|p| {
             let n = p.to_string_lossy().to_lowercase();
             !(n.ends_with("-wal") || n.ends_with("-shm") || n.ends_with("-journal"))
         });
 
+        if files.is_empty() {
+            self.note("Nothing usable in there.", BAD);
+            return;
+        }
+
         for path in files {
             match convert::probe(&path) {
                 Ok(p) => self.assign(p),
-                Err(e) => {
-                    let name = file_name(&path);
-                    self.note(format!("{name} -- skipped: {e}"), BAD);
-                }
+                Err(e) => self.note(format!("{} -- skipped: {e}", file_name(&path)), BAD),
             }
-        }
-
-        if self.out_dir.is_none()
-            && let Some(v) = &self.values
-        {
-            self.out_dir = v.path.parent().map(|p| p.to_path_buf());
         }
     }
 
-    /// Put a recognised database into the slot (or slots) it fits.
+    /// Put a recognised database into the slot (or slots) it fits, and say what
+    /// happened -- including when it is a file that is already loaded.
     fn assign(&mut self, p: Probe) {
         let name = file_name(&p.path);
-        let mut roles: Vec<&str> = Vec::new();
+        let mut loaded: Vec<&str> = Vec::new();
+        let mut again: Vec<&str> = Vec::new();
 
         if p.has_values {
-            if let Some(old) = &self.values
-                && old.path != p.path
-            {
-                self.note(
-                    format!("Replaced values file {}", file_name(&old.path)),
-                    MUTED,
-                );
+            if self.values.as_ref().map(|v| &v.path) == Some(&p.path) {
+                again.push("logged values");
+            } else {
+                if let Some(old) = &self.values {
+                    self.note(
+                        format!("Replaced the value database {}", file_name(&old.path)),
+                        MUTED,
+                    );
+                }
+                self.values = Some(p.clone());
+                loaded.push("logged values");
             }
-            self.values = Some(p.clone());
-            roles.push("logged values");
         }
         if p.has_tags {
-            if let Some(old) = &self.tags
-                && old.path != p.path
-            {
-                self.note(format!("Replaced tag file {}", file_name(&old.path)), MUTED);
+            if self.tags.as_ref().map(|t| &t.path) == Some(&p.path) {
+                again.push("tag names");
+            } else {
+                if let Some(old) = &self.tags {
+                    self.note(
+                        format!("Replaced the tag database {}", file_name(&old.path)),
+                        MUTED,
+                    );
+                }
+                self.tags = Some(p.clone());
+                loaded.push("tag names");
             }
-            self.tags = Some(p.clone());
-            roles.push("tag names");
         }
 
-        self.note(format!("{name} -- recognised as {}", roles.join(" + ")), OK);
+        if !loaded.is_empty() {
+            self.note(format!("{name} -- loaded as {}", loaded.join(" + ")), OK);
+        }
+        if !again.is_empty() {
+            self.note(
+                format!(
+                    "{name} is already loaded as {} -- nothing to do",
+                    again.join(" + ")
+                ),
+                WARN,
+            );
+        }
     }
 
     fn start(&mut self) {
         let (Some(tags), Some(values)) = (&self.tags, &self.values) else {
             return;
         };
-        let out_dir = match self.out_dir.clone() {
-            Some(d) => d,
-            None => match values.path.parent() {
-                Some(p) => p.to_path_buf(),
-                None => {
-                    self.state = State::Failed("no output folder selected".into());
-                    return;
-                }
-            },
-        };
-
         let range = match self.range() {
             Ok(r) => r,
             Err(e) => {
@@ -518,16 +572,13 @@ impl App {
         let job = Job {
             tags_db: tags.path.clone(),
             values_db: values.path.clone(),
-            out_dir,
-            base_name: values
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "hmi".into()),
+            out_dir: self.out_dir(),
+            base_name: self.base_name(),
             semicolon: self.semicolon,
             write_long: self.write_long,
             write_wide: self.write_wide,
             range,
+            shorten_names: self.shorten_names,
         };
 
         // Remember what was typed so the next run can offer it again.
@@ -612,11 +663,24 @@ impl eframe::App for App {
         }
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| match &self.state {
-            State::Running { .. } => self.running_view(ui),
-            State::Done(_) => self.done_view(ui),
-            State::Failed(_) => self.failed_view(ui),
-            State::Setup => self.setup_view(ui, hovering),
+        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            if matches!(self.state, State::Setup) {
+                egui::Panel::bottom("action")
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin {
+                        top: theme::GAP as i8,
+                        ..egui::Margin::ZERO
+                    }))
+                    .show(ui, |ui| self.convert_button(ui));
+            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match &self.state {
+                    State::Running { .. } => self.running_view(ui),
+                    State::Done(_) => self.done_view(ui),
+                    State::Failed(_) => self.failed_view(ui),
+                    State::Setup => self.setup_view(ui, hovering),
+                });
         });
 
         if matches!(self.state, State::Running { .. }) {
@@ -626,14 +690,57 @@ impl eframe::App for App {
 }
 
 impl App {
-    // -- step 1 + 2: files and options ------------------------------------
+    // -- choosing files and options ---------------------------------------
     fn setup_view(&mut self, ui: &mut egui::Ui, hovering: bool) {
         self.drop_zone(ui, hovering);
-        ui.add_space(4.0);
+        ui.add_space(theme::GAP);
+        self.files_view(ui);
+        ui.add_space(theme::GAP);
+        self.range_view(ui);
+        ui.add_space(theme::GAP);
+        self.output_view(ui);
+        self.notes_view(ui);
+    }
 
+    fn drop_zone(&mut self, ui: &mut egui::Ui, hovering: bool) {
+        // Once both databases are in, this steps out of the way.
+        let full = self.tags.is_some() && self.values.is_some();
+        theme::drop_card(hovering).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                if full && !hovering {
+                    ui.horizontal(|ui| {
+                        ui.label(muted("Drop other .db3 files here to replace them"));
+                        if ui.small_button("Choose files...").clicked()
+                            && let Some(files) = pick_databases()
+                        {
+                            self.accept(files);
+                        }
+                    });
+                    return;
+                }
+                ui.add_space(4.0);
+                ui.label(lead(if hovering {
+                    "Release to load"
+                } else {
+                    "Drag the two .db3 files here"
+                }));
+                ui.label(muted("any order, any file name"));
+                ui.add_space(8.0);
+                if ui.button("Choose files...").clicked()
+                    && let Some(files) = pick_databases()
+                {
+                    self.accept(files);
+                }
+                ui.add_space(2.0);
+            });
+        });
+    }
+
+    fn files_view(&mut self, ui: &mut egui::Ui) {
         let tags = self.tags.clone();
         let values = self.values.clone();
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             slot_row(
                 ui,
@@ -642,36 +749,215 @@ impl App {
                 "waiting for the database that holds LoggingTag",
                 |p| format!("{} tags", sep(p.tag_count)),
             );
-            ui.add_space(6.0);
+            ui.add_space(theme::GAP);
             slot_row(
                 ui,
                 "Logged values",
                 values.as_ref(),
                 "waiting for the database that holds LoggedProcessValue",
-                |p| {
-                    let mut s = format!("{} rows", sep(p.value_rows));
-                    if let Some((a, b)) = &p.span {
-                        s.push_str(&format!("   {}  ->  {}", short_time(a), short_time(b)));
-                    }
-                    s
+                |p| match p.span {
+                    Some((a, b)) => format!(
+                        "{} rows    {}  to  {}",
+                        sep(p.value_rows),
+                        convert::filetime_to_short(a),
+                        convert::filetime_to_short(b)
+                    ),
+                    None => format!("{} rows", sep(p.value_rows)),
                 },
             );
         });
+    }
 
-        ui.add_space(2.0);
-        self.range_view(ui);
-        ui.add_space(2.0);
-        self.options(ui);
+    /// Cut the log down to a time slice, with a live count of what survives.
+    fn range_view(&mut self, ui: &mut egui::Ui) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, "Time range", "optional -- empty means everything");
+            ui.add_space(theme::GAP);
 
-        ui.add_space(8.0);
-        let ready = self.ready();
-        let button = egui::Button::new(egui::RichText::new("Convert to CSV").size(16.0))
-            .min_size(egui::vec2(ui.available_width(), 40.0))
-            .fill(if ready {
-                ACCENT
-            } else {
-                egui::Color32::from_gray(60)
+            let last_from = self.last.from.clone();
+            let last_until = self.last.until.clone();
+            range_field(ui, "From", &mut self.from_text, &last_from, false);
+            ui.add_space(4.0);
+            range_field(ui, "Until", &mut self.until_text, &last_until, true);
+
+            ui.add_space(theme::GAP);
+            match &self.preview {
+                Preview::Idle => {
+                    ui.label(muted("Load the value database to see how much is kept."));
+                }
+                Preview::Counting => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(muted("counting..."));
+                    });
+                }
+                Preview::Bad(e) => {
+                    ui.label(body(e).color(BAD));
+                }
+                Preview::Kept(k) => {
+                    let color = if k.rows == 0 {
+                        BAD
+                    } else if k.rows == k.total_rows {
+                        TEXT
+                    } else {
+                        OK
+                    };
+                    ui.label(
+                        strong(if k.rows == 0 {
+                            "Nothing is left in this range.".to_string()
+                        } else {
+                            format!(
+                                "Keeps {} of {} values  ({} timestamps)",
+                                sep(k.rows),
+                                sep(k.total_rows),
+                                sep(k.timestamps)
+                            )
+                        })
+                        .color(color),
+                    );
+                    if let Some((a, b)) = k.span {
+                        ui.label(muted(format!(
+                            "{}  to  {}",
+                            convert::filetime_to_short(a),
+                            convert::filetime_to_short(b)
+                        )));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Where the CSV files go and what they are called.
+    fn output_view(&mut self, ui: &mut egui::Ui) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, "Save to", "");
+            ui.add_space(theme::GAP);
+
+            ui.horizontal(|ui| {
+                ui.label(body("Name"));
+                let mut name = self.base_name();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut name)
+                            .desired_width(220.0)
+                            .hint_text("file name"),
+                    )
+                    .changed()
+                {
+                    self.base_name = Some(name);
+                }
+                if ui
+                    .button("Browse...")
+                    .on_hover_text("Pick the folder and the name in Explorer")
+                    .clicked()
+                {
+                    self.browse_output();
+                }
             });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(muted("Folder"));
+                match self.chosen_dir() {
+                    Some(dir) => {
+                        if ui
+                            .link(muted(elide(&dir.display().to_string(), 52)))
+                            .on_hover_text(format!(
+                                "{}\n\nClick to open in Explorer",
+                                dir.display()
+                            ))
+                            .clicked()
+                        {
+                            open_folder(&dir);
+                        }
+                    }
+                    None => {
+                        ui.label(muted("beside the value database, once it is loaded"));
+                    }
+                }
+            });
+            for f in self.output_files() {
+                ui.label(muted(format!("writes  {f}")));
+            }
+            if self.output_files().is_empty() {
+                ui.label(body("Pick at least one table below.").color(WARN));
+            }
+
+            ui.add_space(theme::GAP);
+            self.options_view(ui);
+        });
+    }
+
+    fn options_view(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.write_long, "Long table -- one row per value");
+        ui.checkbox(
+            &mut self.write_wide,
+            "Wide table -- one row per timestamp, one column per tag",
+        );
+        ui.checkbox(
+            &mut self.semicolon,
+            "Separate with ;  (Excel with a comma decimal mark)",
+        );
+        ui.checkbox(&mut self.shorten_names, "Shorten tag names");
+
+        if self.shorten_names {
+            ui.add_space(2.0);
+            ui.indent("shorten_example", |ui| match self.shorten_example() {
+                Some((full, short)) => {
+                    ui.label(muted(full.to_string()));
+                    ui.label(muted(format!("becomes   {short}")).color(OK));
+                }
+                None => {
+                    ui.label(muted("Load the tag database to see an example."));
+                }
+            });
+        }
+    }
+
+    /// One real tag, before and after shortening, so the option is not a guess.
+    fn shorten_example(&self) -> Option<(String, String)> {
+        let tags = self.tags.as_ref()?;
+        let short = convert::shorten_tag_names(&tags.tag_names);
+        let (id, full) = tags.tag_names.first()?;
+        Some((full.clone(), short.get(id)?.clone()))
+    }
+
+    /// Ask for the output name with a file dialog, so the folder and the
+    /// suggested name are both visible in Explorer.
+    fn browse_output(&mut self) {
+        let suggested = format!("{}_long.csv", self.base_name());
+        let Some(path) = rfd::FileDialog::new()
+            .set_directory(self.out_dir())
+            .set_file_name(&suggested)
+            .set_title("Choose where to save and how to name the files")
+            .add_filter("CSV", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            self.out_dir = Some(dir.to_path_buf());
+        }
+        // The dialog hands back one full file name; keep only the common part.
+        let mut stem = stem_of(&path);
+        for tail in ["_long", "_wide"] {
+            if let Some(cut) = stem.strip_suffix(tail) {
+                stem = cut.to_string();
+            }
+        }
+        if !stem.trim().is_empty() {
+            self.base_name = Some(stem);
+        }
+    }
+
+    fn convert_button(&mut self, ui: &mut egui::Ui) {
+        let ready = self.ready();
+        let label = theme::on_accent("Convert to CSV", ready);
+        let button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
+            .min_size(egui::vec2(ui.available_width(), 42.0))
+            .fill(theme::button_fill(ready));
         if ui.add_enabled(ready, button).clicked() {
             self.start();
         }
@@ -682,172 +968,18 @@ impl App {
             } else if self.values.is_none() && self.tags.is_some() {
                 "Still missing the value database."
             } else if !self.write_long && !self.write_wide {
-                "Pick at least one output table under Options."
+                "Pick at least one table to write."
+            } else if self.tags.is_none() && self.values.is_none() {
+                "Step 1 -- drop both .db3 files above.    Step 2 -- press Convert."
             } else {
-                "Step 1 -- drop both .db3 files above.   Step 2 -- press Convert."
+                "Check the time range above."
             };
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(hint).color(MUTED).size(13.0));
-        }
-
-        self.notes_view(ui);
-    }
-
-    fn drop_zone(&mut self, ui: &mut egui::Ui, hovering: bool) {
-        let (fill, stroke) = if hovering {
-            (ACCENT.gamma_multiply(0.18), egui::Stroke::new(2.0, ACCENT))
-        } else {
-            (
-                egui::Color32::from_gray(32),
-                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
-            )
-        };
-
-        egui::Frame::group(ui.style())
-            .fill(fill)
-            .stroke(stroke)
-            .inner_margin(egui::Margin::symmetric(12, 16))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    let head = if hovering {
-                        "Release to load"
-                    } else {
-                        "Drag the two .db3 files here"
-                    };
-                    ui.label(egui::RichText::new(head).size(16.0).strong());
-                    ui.label(
-                        egui::RichText::new("any order, any file name")
-                            .color(MUTED)
-                            .size(12.0),
-                    );
-                    ui.add_space(6.0);
-                    if ui.button("Choose files...").clicked()
-                        && let Some(files) = rfd::FileDialog::new()
-                            .add_filter("HMI databases", &["db3", "db", "sqlite", "sqlite3"])
-                            .add_filter("All files", &["*"])
-                            .set_title("Select Tags and Values databases")
-                            .pick_files()
-                    {
-                        self.accept(files);
-                    }
-                });
-            });
-    }
-
-    /// Cut the log down to a time slice, with a live count of what survives.
-    fn range_view(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Time range").strong());
-                ui.label(
-                    egui::RichText::new("optional -- leave empty to take everything")
-                        .color(MUTED)
-                        .size(12.0),
-                );
-            });
-            ui.add_space(4.0);
-
-            let last_from = self.last.from.clone();
-            let last_until = self.last.until.clone();
-            range_field(ui, "From ", &mut self.from_text, &last_from, false);
-            range_field(ui, "Until", &mut self.until_text, &last_until, true);
-
             ui.add_space(6.0);
-            match &self.preview {
-                Preview::Idle => {
-                    ui.label(
-                        egui::RichText::new("Load the value database to see how much is kept.")
-                            .color(MUTED)
-                            .size(12.5),
-                    );
-                }
-                Preview::Counting => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("counting...").color(MUTED));
-                    });
-                }
-                Preview::Bad(e) => {
-                    ui.label(egui::RichText::new(e).color(BAD).size(13.0));
-                }
-                Preview::Kept(k) => {
-                    let all = k.rows == k.total_rows;
-                    let color = if k.rows == 0 {
-                        BAD
-                    } else if all {
-                        MUTED
-                    } else {
-                        OK
-                    };
-                    ui.label(
-                        egui::RichText::new(if k.rows == 0 {
-                            "Nothing is left in this range.".to_string()
-                        } else {
-                            format!(
-                                "Keeps {} of {} values   ({} timestamps)",
-                                sep(k.rows),
-                                sep(k.total_rows),
-                                sep(k.timestamps)
-                            )
-                        })
-                        .color(color)
-                        .size(13.5)
-                        .strong(),
-                    );
-                    if let Some((a, b)) = &k.span {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}   ->   {}",
-                                short_time(a),
-                                short_time(b)
-                            ))
-                            .color(MUTED)
-                            .size(12.0),
-                        );
-                    }
-                }
-            }
-        });
+            ui.vertical_centered(|ui| ui.label(muted(hint)));
+        }
     }
 
-    fn options(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Options")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.checkbox(
-                    &mut self.write_long,
-                    "Long table -- one row per value (pk_TimeStamp, pk_fk_Id, Value, Name)",
-                );
-                ui.checkbox(
-                    &mut self.write_wide,
-                    "Wide table -- one row per timestamp, one column per tag",
-                );
-                ui.checkbox(
-                    &mut self.semicolon,
-                    "Use ; as separator (for Excel with a comma decimal mark)",
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Save to:");
-                    let shown = self
-                        .out_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "next to the value database".into());
-                    ui.label(egui::RichText::new(elide(&shown, 46)).color(MUTED))
-                        .on_hover_text(shown);
-                    if ui.small_button("Change...").clicked()
-                        && let Some(d) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.out_dir = Some(d);
-                    }
-                });
-            });
-    }
-
-    // -- step 3: progress --------------------------------------------------
+    // -- while it runs -----------------------------------------------------
     fn running_view(&mut self, ui: &mut egui::Ui) {
         let State::Running {
             cancel,
@@ -861,128 +993,139 @@ impl App {
         };
         let (stage, done, total, cancel) = (stage.clone(), *done, *total, cancel.clone());
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(format!("{stage}..."))
-                    .size(15.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
+            ui.label(lead(format!("{stage}...")));
+            ui.add_space(theme::GAP);
 
             let fraction = if total > 0 {
                 (done as f32 / total as f32).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let text = if total > 0 {
-                format!("{}  /  {} rows", sep(done), sep(total))
-            } else {
-                "preparing".into()
-            };
             ui.add(
                 egui::ProgressBar::new(fraction)
-                    .text(text)
-                    .fill(ACCENT)
+                    .text(theme::on_accent(
+                        if total > 0 {
+                            format!("{}  /  {} rows", sep(done), sep(total))
+                        } else {
+                            "preparing".into()
+                        },
+                        true,
+                    ))
+                    .fill(theme::ACCENT_FILL)
                     .animate(total == 0)
-                    .desired_height(22.0),
+                    .desired_height(24.0),
             );
         });
 
-        ui.add_space(8.0);
+        ui.add_space(theme::GAP);
         if ui
-            .add(egui::Button::new("Cancel").min_size(egui::vec2(120.0, 32.0)))
+            .add(egui::Button::new("Cancel").min_size(egui::vec2(140.0, 34.0)))
             .clicked()
         {
             cancel.store(true, Ordering::Relaxed);
         }
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("The source databases are only read, never changed.")
-                .color(MUTED)
-                .size(12.0),
-        );
+        ui.add_space(6.0);
+        ui.label(muted("The source databases are only read, never changed."));
     }
 
-    // -- step 4: result ----------------------------------------------------
+    // -- the result --------------------------------------------------------
     fn done_view(&mut self, ui: &mut egui::Ui) {
         let State::Done(s) = &self.state else { return };
         let s = s.clone();
 
-        ui.label(
-            egui::RichText::new("Finished")
-                .size(18.0)
-                .strong()
-                .color(OK),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "{} values from {} tags in {:.1} s",
-                sep(s.rows),
-                s.tags_used,
-                s.secs
-            ))
-            .color(MUTED),
-        );
-        ui.add_space(8.0);
+        ui.label(theme::heading("Finished").color(OK));
+        ui.label(muted(format!(
+            "{} values from {} tags in {:.1} s",
+            sep(s.rows),
+            s.tags_used,
+            s.secs
+        )));
+        ui.add_space(theme::GAP);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for (path, rows) in &s.files {
+            for (i, (path, rows)) in s.files.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(theme::GAP);
+                }
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("[ok]").color(OK).monospace());
+                    dot(ui, OK);
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(file_name(path)).strong());
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} rows   {}",
-                                sep(*rows),
-                                human_size(path)
+                        if ui
+                            .link(strong(file_name(path)))
+                            .on_hover_text(format!(
+                                "{}\n\nClick to show in Explorer",
+                                path.display()
                             ))
-                            .color(MUTED)
-                            .size(12.0),
-                        );
+                            .clicked()
+                        {
+                            reveal(path);
+                        }
+                        ui.label(muted(format!(
+                            "{} rows    {}",
+                            sep(*rows),
+                            human_size(path)
+                        )));
                     });
                 });
             }
         });
 
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Details").strong());
-        if let Some((a, b)) = &s.span {
-            ui.label(format!("Time range   {a}  ->  {b}"));
-        }
-        ui.label(format!(
-            "Tags   {} of {} configured tags actually logged values",
-            s.tags_used, s.tags_total
-        ));
-        ui.label(format!("Timestamps   {}", sep(s.timestamps)));
-        if s.bad_quality > 0 {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} rows have a Quality other than 192 (not good) -- kept, see the Quality column",
-                    sep(s.bad_quality)
-                ))
-                .color(WARN),
+        ui.add_space(theme::GAP);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, "Details", "");
+            ui.add_space(theme::GAP);
+            if let Some((a, b)) = s.span {
+                kv(
+                    ui,
+                    "Time range",
+                    format!(
+                        "{}  to  {}",
+                        convert::filetime_to_short(a),
+                        convert::filetime_to_short(b)
+                    ),
+                );
+            }
+            kv(
+                ui,
+                "Tags",
+                format!(
+                    "{} of {} configured tags logged values",
+                    s.tags_used, s.tags_total
+                ),
             );
-        }
-        if !s.unknown_ids.is_empty() {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} tag ids had no name in the tag database, written as id_<number>",
-                    s.unknown_ids.len()
-                ))
-                .color(WARN),
-            );
-        }
+            kv(ui, "Timestamps", sep(s.timestamps));
+            if s.bad_quality > 0 {
+                ui.add_space(4.0);
+                ui.label(
+                    body(format!(
+                        "{} rows have a Quality other than 192 -- kept, see the Quality column",
+                        sep(s.bad_quality)
+                    ))
+                    .color(WARN),
+                );
+            }
+            if !s.unknown_ids.is_empty() {
+                ui.label(
+                    body(format!(
+                        "{} tag ids had no name and were written as id_<number>",
+                        s.unknown_ids.len()
+                    ))
+                    .color(WARN),
+                );
+            }
+        });
 
-        ui.add_space(12.0);
+        ui.add_space(theme::GAP);
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new("Open folder")
-                        .min_size(egui::vec2(140.0, 34.0))
-                        .fill(ACCENT),
+                    egui::Button::new(theme::on_accent("Open folder", true))
+                        .min_size(egui::vec2(150.0, 36.0))
+                        .fill(theme::ACCENT_FILL),
                 )
                 .clicked()
                 && let Some((p, _)) = s.files.first()
@@ -990,7 +1133,7 @@ impl App {
                 reveal(p);
             }
             if ui
-                .add(egui::Button::new("Convert more").min_size(egui::vec2(140.0, 34.0)))
+                .add(egui::Button::new("Convert more").min_size(egui::vec2(150.0, 36.0)))
                 .clicked()
             {
                 self.state = State::Setup;
@@ -1007,38 +1150,35 @@ impl App {
         let cancelled = msg == "cancelled";
 
         ui.label(
-            egui::RichText::new(if cancelled {
+            theme::heading(if cancelled {
                 "Cancelled"
             } else {
                 "It did not work"
             })
-            .size(18.0)
-            .strong()
             .color(if cancelled { WARN } else { BAD }),
         );
-        ui.add_space(6.0);
+        ui.add_space(theme::GAP);
         if cancelled {
-            ui.label("Nothing was finished. Any half-written CSV file can be deleted.");
+            ui.label(body(
+                "Nothing was finished. Any half-written CSV file can be deleted.",
+            ));
         } else {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(msg).color(BAD));
+                ui.label(body(msg).color(BAD));
             });
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "Check that both files are the databases from the same HMI export and \
-                     that the output folder can be written to.",
-                )
-                .color(MUTED),
-            );
+            ui.add_space(theme::GAP);
+            ui.label(muted(
+                "Check that both files come from the same HMI export and that the \
+                 output folder can be written to.",
+            ));
         }
-        ui.add_space(12.0);
+        ui.add_space(theme::GAP);
         if ui
             .add(
-                egui::Button::new("Back")
-                    .min_size(egui::vec2(140.0, 34.0))
-                    .fill(ACCENT),
+                egui::Button::new(theme::on_accent("Back", true))
+                    .min_size(egui::vec2(150.0, 36.0))
+                    .fill(theme::ACCENT_FILL),
             )
             .clicked()
         {
@@ -1050,20 +1190,43 @@ impl App {
         if self.notes.is_empty() {
             return;
         }
-        ui.add_space(10.0);
-        ui.separator();
+        ui.add_space(theme::GAP);
         egui::ScrollArea::vertical()
-            .max_height(110.0)
+            .id_salt("notes")
+            .max_height(96.0)
             .show(ui, |ui| {
                 for (text, color) in &self.notes {
-                    ui.label(egui::RichText::new(text).color(*color).size(12.5));
+                    ui.label(muted(text).color(*color));
                 }
             });
     }
 }
 
-// ---------------------------------------------------------------- helpers
+// ---------------------------------------------------------------- pieces
 
+/// A card heading with an optional grey remark beside it.
+fn section(ui: &mut egui::Ui, title: &str, remark: &str) {
+    ui.horizontal(|ui| {
+        ui.label(strong(title));
+        if !remark.is_empty() {
+            ui.label(muted(remark));
+        }
+    });
+}
+
+/// A right-hand value beside a grey label.
+fn kv(ui: &mut egui::Ui, key: &str, value: impl Into<String>) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [110.0, 18.0],
+            egui::Label::new(muted(key)).halign(egui::Align::LEFT),
+        );
+        ui.label(body(value.into()));
+    });
+}
+
+/// One loaded database: state dot, what it is, the file (click to show it in
+/// Explorer) and what was found inside.
 fn slot_row(
     ui: &mut egui::Ui,
     title: &str,
@@ -1072,82 +1235,88 @@ fn slot_row(
     detail: impl Fn(&Probe) -> String,
 ) {
     ui.horizontal(|ui| {
-        let (mark, color) = match probe {
-            Some(_) => ("[ok]", OK),
-            None => ("[  ]", MUTED),
-        };
-        ui.label(egui::RichText::new(mark).color(color).monospace());
+        dot(ui, if probe.is_some() { OK } else { DIM });
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new(title).strong());
+            ui.label(strong(title));
             match probe {
                 Some(p) => {
-                    ui.label(
-                        egui::RichText::new(file_name(&p.path))
-                            .color(ACCENT)
-                            .size(12.5),
-                    )
-                    .on_hover_text(p.path.display().to_string());
-                    ui.label(egui::RichText::new(detail(p)).color(MUTED).size(12.0));
+                    if ui
+                        .link(body(file_name(&p.path)).color(ACCENT))
+                        .on_hover_text(format!("{}\n\nClick to show in Explorer", p.path.display()))
+                        .clicked()
+                    {
+                        reveal(&p.path);
+                    }
+                    ui.label(muted(detail(p)));
                 }
                 None => {
-                    ui.label(egui::RichText::new(missing).color(MUTED).size(12.5));
+                    ui.label(muted(missing));
                 }
             }
         });
     });
 }
 
-/// One date/time input: the field itself, the remembered value as placeholder
-/// and as a button, and the exact instant it resolves to.
+/// One date/time input: the field, the remembered value as placeholder and as a
+/// button, and the exact instant it resolves to.
 fn range_field(ui: &mut egui::Ui, label: &str, text: &mut String, last: &str, end_of_day: bool) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).monospace());
+        ui.add_sized([44.0, 18.0], egui::Label::new(body(label)));
 
         let hint = if last.trim().is_empty() {
-            "2026-09-18 06:30".to_string()
+            "18.09.2026 06:30".to_string()
         } else {
             last.trim().to_string()
         };
         ui.add(
             egui::TextEdit::singleline(text)
-                .hint_text(&hint)
-                .desired_width(200.0),
+                .hint_text(hint)
+                .desired_width(190.0),
         );
 
         if !last.trim().is_empty()
             && text.trim() != last.trim()
             && ui
-                .small_button("Use last")
-                .on_hover_text(format!("Paste the value used last time: {}", last.trim()))
+                .button("Use last")
+                .on_hover_text(format!("Paste what was used last time: {}", last.trim()))
                 .clicked()
         {
             *text = last.trim().to_string();
         }
-        if !text.is_empty() && ui.small_button("Clear").clicked() {
+        if !text.is_empty() && ui.button("Clear").clicked() {
             text.clear();
         }
 
         if !text.trim().is_empty() {
             match convert::parse_when(text, end_of_day) {
-                Ok(t) => {
-                    ui.label(
-                        egui::RichText::new(format!("= {}", convert::filetime_to_iso(t)))
-                            .color(MUTED)
-                            .size(12.0),
-                    );
-                }
-                Err(e) => {
-                    ui.label(egui::RichText::new(e).color(BAD).size(12.0));
-                }
-            }
+                Ok(t) => ui.label(muted(format!("= {}", convert::filetime_to_text(t)))),
+                Err(e) => ui.label(muted(e).color(BAD)),
+            };
         }
     });
+}
+
+// ---------------------------------------------------------------- helpers
+
+/// Ask for the two databases.
+fn pick_databases() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .add_filter("HMI databases", &["db3", "db", "sqlite", "sqlite3"])
+        .add_filter("All files", &["*"])
+        .set_title("Select the Tags and Values databases")
+        .pick_files()
 }
 
 fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+fn stem_of(p: &Path) -> String {
+    p.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hmi".into())
 }
 
 /// 602912 -> "602 912"
@@ -1161,15 +1330,6 @@ fn sep(n: u64) -> String {
         out.push(c);
     }
     out
-}
-
-/// "2026-09-18T06:03:48.7883740Z" -> "2026-09-18 06:03:48"
-fn short_time(iso: &str) -> String {
-    iso.replace('T', " ")
-        .split('.')
-        .next()
-        .unwrap_or(iso)
-        .to_string()
 }
 
 fn human_size(p: &Path) -> String {
@@ -1197,7 +1357,7 @@ fn elide(s: &str, max: usize) -> String {
     )
 }
 
-/// Show the finished file in the system file manager.
+/// Show a file in the system file manager, selected.
 fn reveal(path: &Path) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("explorer")
@@ -1214,6 +1374,16 @@ fn reveal(path: &Path) {
     }
 }
 
+/// Open a folder itself.
+fn open_folder(dir: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,10 +1398,8 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_shorten() {
-        assert_eq!(
-            short_time("2026-09-18T06:03:48.7883740Z"),
-            "2026-09-18 06:03:48"
-        );
+    fn long_paths_are_shortened_from_the_left() {
+        assert_eq!(elide("short", 20), "short");
+        assert_eq!(elide("D:/a/very/long/path/x", 10), ".../path/x");
     }
 }

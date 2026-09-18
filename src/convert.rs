@@ -36,23 +36,27 @@ const QUALITY_GOOD: i64 = 192;
 const FILETIME_EPOCH_DIFF_SECS: i64 = 11_644_473_600; // 1601-01-01 -> 1970-01-01
 const TICKS_PER_SEC: i64 = 10_000_000;
 
-/// FILETIME ticks -> `2026-09-18T06:03:48.7883740Z`.
-pub fn filetime_to_iso(ticks: i64) -> String {
+/// FILETIME ticks -> `18.09.2026 06:03:48.7883740` (UTC), the form written to
+/// the CSV files. Every date shown or written by this program looks like this.
+pub fn filetime_to_text(ticks: i64) -> String {
+    let (y, m, d, h, mi, s, frac) = parts(ticks);
+    format!("{d:02}.{m:02}.{y:04} {h:02}:{mi:02}:{s:02}.{frac:07}")
+}
+
+/// The same instant without the fraction: `18.09.2026 06:03:48`.
+/// Used wherever a whole second is precise enough to read.
+pub fn filetime_to_short(ticks: i64) -> String {
+    let (y, m, d, h, mi, s, _) = parts(ticks);
+    format!("{d:02}.{m:02}.{y:04} {h:02}:{mi:02}:{s:02}")
+}
+
+/// Split FILETIME ticks into (year, month, day, hour, minute, second, 100ns).
+fn parts(ticks: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
     let secs = ticks.div_euclid(TICKS_PER_SEC) - FILETIME_EPOCH_DIFF_SECS;
     let frac = ticks.rem_euclid(TICKS_PER_SEC);
-    let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:07}Z",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60,
-        frac
-    )
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    (y, m, d, sod / 3600, (sod % 3600) / 60, sod % 60, frac)
 }
 
 /// (year, month, day) -> days since the Unix epoch. Inverse of [`civil_from_days`].
@@ -171,6 +175,140 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+// ---------------------------------------------------------------- tag names
+
+/// Characters that separate the parts of a tag name.
+const SEPARATORS: [u8; 4] = *b":_.-";
+
+/// Try to shorten every tag name to the part that actually distinguishes it.
+///
+/// `Anlage1::Zustand_DruckvorPumpe2:Archivvariable_1` becomes
+/// `DruckvorPumpe2`: whatever every name has in common is dropped, and so is
+/// the leading category (`Zustand_`, `Parameter_`, ...).
+///
+/// Names must stay unique, because they become column headings. Any name that
+/// would clash keeps its category, then its full text, so shortening never
+/// merges two different tags.
+pub fn shorten_tag_names(names: &[(i64, String)]) -> HashMap<i64, String> {
+    let mut sorted: Vec<&(i64, String)> = names.iter().collect();
+    sorted.sort_by_key(|(id, _)| *id);
+    let full: Vec<&str> = sorted.iter().map(|(_, n)| n.as_str()).collect();
+
+    let (pre, suf) = common_affixes(&full);
+    let core: Vec<String> = full.iter().map(|f| core_of(f, pre, suf)).collect();
+    let short: Vec<String> = core.iter().map(|c| drop_category(c)).collect();
+
+    // Shortest form first, falling back for whatever would clash.
+    let seen = tally(&short);
+    let mut chosen: Vec<String> = (0..full.len())
+        .map(|i| {
+            if seen[&short[i]] == 1 {
+                short[i].clone()
+            } else {
+                core[i].clone()
+            }
+        })
+        .collect();
+
+    let seen = tally(&chosen);
+    for (i, name) in chosen.iter_mut().enumerate() {
+        if seen[&*name] > 1 {
+            *name = full[i].to_string();
+        }
+    }
+
+    // Two tags configured with the very same name: keep them apart by number.
+    let seen = tally(&chosen);
+    for (i, name) in chosen.iter_mut().enumerate() {
+        if seen[&*name] > 1 {
+            *name = format!("{name}_id{}", sorted[i].0);
+        }
+    }
+
+    sorted
+        .iter()
+        .zip(chosen)
+        .map(|((id, _), name)| (*id, name))
+        .collect()
+}
+
+fn tally(names: &[String]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for n in names {
+        *counts.entry(n.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// How many bytes at the start and at the end every name shares, cut back to a
+/// separator so that words are never sliced in half.
+fn common_affixes(names: &[&str]) -> (usize, usize) {
+    if names.len() < 2 {
+        return (0, 0);
+    }
+    let first = names[0].as_bytes();
+    let shortest = names.iter().map(|n| n.len()).min().unwrap_or(0);
+
+    let mut pre = first.len();
+    for n in &names[1..] {
+        let b = n.as_bytes();
+        let mut i = 0;
+        while i < pre && i < b.len() && b[i] == first[i] {
+            i += 1;
+        }
+        pre = i;
+    }
+    while pre > 0 && !SEPARATORS.contains(&first[pre - 1]) {
+        pre -= 1;
+    }
+
+    let mut suf = shortest - pre.min(shortest);
+    for n in &names[1..] {
+        let b = n.as_bytes();
+        let mut i = 0;
+        while i < suf && b[b.len() - 1 - i] == first[first.len() - 1 - i] {
+            i += 1;
+        }
+        suf = i;
+    }
+    // The common tail must begin at a separator, or it is not a whole part.
+    let mut trimmed = 0;
+    for i in (first.len() - suf)..first.len() {
+        if SEPARATORS.contains(&first[i]) {
+            trimmed = first.len() - i;
+            break;
+        }
+    }
+    (pre, trimmed)
+}
+
+/// The name with the shared head and tail removed.
+fn core_of(full: &str, pre: usize, suf: usize) -> String {
+    let end = full.len().saturating_sub(suf).max(pre);
+    let core = full
+        .get(pre..end)
+        .unwrap_or(full)
+        .trim_matches(|c: char| c == ':' || c == '_' || c.is_whitespace());
+    if core.is_empty() {
+        full.to_string()
+    } else {
+        core.to_string()
+    }
+}
+
+/// `Zustand_DruckvorPumpe2` -> `DruckvorPumpe2`; a name without a
+/// category (`Fehler1`) is left alone.
+fn drop_category(core: &str) -> String {
+    // Still a full path (a single tag has nothing to compare against): leave it.
+    if core.contains(':') {
+        return core.to_string();
+    }
+    match core.split_once('_') {
+        Some((head, rest)) if !head.is_empty() && !rest.is_empty() => rest.to_string(),
+        _ => core.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------- opening
 
 /// Open a database for reading without ever modifying the original file.
@@ -253,8 +391,12 @@ pub struct Probe {
     pub has_tags: bool,
     pub has_values: bool,
     pub tag_count: u64,
+    /// Every configured tag, so the window can preview the shortening.
+    /// Empty unless this is the tag database.
+    pub tag_names: Vec<(i64, String)>,
     pub value_rows: u64,
-    pub span: Option<(String, String)>,
+    /// First and last logged instant, as FILETIME ticks.
+    pub span: Option<(i64, i64)>,
 }
 
 /// Inspect a file and decide, from its schema alone, which role it can play.
@@ -271,6 +413,11 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
     }
 
     let tag_count = if has_tags { count(&conn, TAG_TABLE) } else { 0 };
+    let tag_names = if has_tags {
+        read_tag_names(&conn).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut value_rows = 0;
     let mut span = None;
     if has_values {
@@ -285,7 +432,7 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
         );
         if let Ok((Some(lo), Some(hi))) = bounds {
-            span = Some((filetime_to_iso(lo), filetime_to_iso(hi)));
+            span = Some((lo, hi));
         }
     }
 
@@ -294,9 +441,31 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
         has_tags,
         has_values,
         tag_count,
+        tag_names,
         value_rows,
         span,
     })
+}
+
+/// Every tag id and its configured name. When a tag has several configuration
+/// versions the newest name wins.
+fn read_tag_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+    let sql = format!("SELECT pk_Key, Name FROM \"{TAG_TABLE}\" ORDER BY pk_StartTime");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("{TAG_TABLE}: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let mut by_key: HashMap<i64, String> = HashMap::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let key: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let name: Option<String> = row.get(1).map_err(|e| e.to_string())?;
+        if let Some(name) = name {
+            by_key.insert(key, name);
+        }
+    }
+    let mut out: Vec<(i64, String)> = by_key.into_iter().collect();
+    out.sort_by_key(|(id, _)| *id);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- time range
@@ -331,7 +500,8 @@ pub struct Kept {
     pub rows: u64,
     pub timestamps: u64,
     pub total_rows: u64,
-    pub span: Option<(String, String)>,
+    /// First and last instant that survives the range, as FILETIME ticks.
+    pub span: Option<(i64, i64)>,
 }
 
 /// Count what a time window would keep, without writing anything.
@@ -375,7 +545,7 @@ pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
         timestamps,
         total_rows,
         span: match (lo, hi) {
-            (Some(a), Some(b)) => Some((filetime_to_iso(a), filetime_to_iso(b))),
+            (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         },
     })
@@ -393,6 +563,8 @@ pub struct Job {
     pub write_wide: bool,
     /// Only values inside this window are written.
     pub range: Range,
+    /// Shorten tag names to the part that tells them apart.
+    pub shorten_names: bool,
 }
 
 #[derive(Debug)]
@@ -413,7 +585,8 @@ pub struct Summary {
     pub tags_total: usize,
     pub unknown_ids: Vec<i64>,
     pub bad_quality: u64,
-    pub span: Option<(String, String)>,
+    /// First and last instant actually written, as FILETIME ticks.
+    pub span: Option<(i64, i64)>,
     pub secs: f32,
 }
 
@@ -444,23 +617,13 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     // -- 1. tag names ------------------------------------------------------
     say("Reading tag names");
     let tags = open_readonly(&job.tags_db)?;
-    let mut names: HashMap<i64, String> = HashMap::new();
-    {
-        // When a tag has several configuration versions the newest name wins.
-        let sql = format!("SELECT pk_Key, Name FROM \"{TAG_TABLE}\" ORDER BY pk_StartTime");
-        let mut stmt = tags
-            .prepare(&sql)
-            .map_err(|e| format!("{TAG_TABLE}: {e}"))?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let key: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let name: Option<String> = row.get(1).map_err(|e| e.to_string())?;
-            if let Some(name) = name {
-                names.insert(key, name);
-            }
-        }
-    }
-    let tags_total = names.len();
+    let listed = read_tag_names(&tags)?;
+    let tags_total = listed.len();
+    let names: HashMap<i64, String> = if job.shorten_names {
+        shorten_tag_names(&listed)
+    } else {
+        listed.into_iter().collect()
+    };
 
     // -- 2. find out what the value database actually holds -----------------
     say("Scanning logged values");
@@ -634,7 +797,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         // A timestamp is shared by ~100 consecutive rows, so format it once.
         let iso = match &bucket_ts {
             Some((t, iso)) if *t == ts => iso.clone(),
-            _ => filetime_to_iso(ts),
+            _ => filetime_to_text(ts),
         };
 
         if let Some(w) = long.as_mut() {
@@ -702,7 +865,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         tags_total,
         unknown_ids,
         bad_quality,
-        span: first_ts.map(|f| (filetime_to_iso(f), filetime_to_iso(last_ts))),
+        span: first_ts.map(|f| (f, last_ts)),
         secs: started.elapsed().as_secs_f32(),
     })
 }
@@ -735,50 +898,51 @@ mod tests {
     #[test]
     fn filetime_matches_known_points() {
         // 1601-01-01 is tick zero.
-        assert_eq!(filetime_to_iso(0), "1601-01-01T00:00:00.0000000Z");
+        assert_eq!(filetime_to_text(0), "01.01.1601 00:00:00.0000000");
         // 1970-01-01, the Unix epoch.
         assert_eq!(
-            filetime_to_iso(FILETIME_EPOCH_DIFF_SECS * TICKS_PER_SEC),
-            "1970-01-01T00:00:00.0000000Z"
+            filetime_to_text(FILETIME_EPOCH_DIFF_SECS * TICKS_PER_SEC),
+            "01.01.1970 00:00:00.0000000"
         );
         // A real row out of Values.db3.
         assert_eq!(
-            filetime_to_iso(134_341_850_287_883_740),
-            "2026-09-18T06:03:48.7883740Z"
+            filetime_to_text(134_341_850_287_883_740),
+            "18.09.2026 06:03:48.7883740"
         );
         // A leap day, to exercise the calendar maths.
         assert_eq!(
-            filetime_to_iso(133_536_384_000_000_000),
-            "2024-02-29T00:00:00.0000000Z"
+            filetime_to_text(133_536_384_000_000_000),
+            "29.02.2024 00:00:00.0000000"
         );
     }
 
     #[test]
     fn typed_dates_round_trip() {
         let day = parse_when("2026-09-18", false).unwrap();
-        assert_eq!(filetime_to_iso(day), "2026-09-18T00:00:00.0000000Z");
+        assert_eq!(filetime_to_text(day), "18.09.2026 00:00:00.0000000");
 
         // The same day written the German way.
         assert_eq!(parse_when("18.09.2026", false).unwrap(), day);
 
         // An upper bound given as a bare date covers the whole day.
         assert_eq!(
-            filetime_to_iso(parse_when("2026-09-18", true).unwrap()),
-            "2026-09-18T23:59:59.9999999Z"
+            filetime_to_text(parse_when("2026-09-18", true).unwrap()),
+            "18.09.2026 23:59:59.9999999"
         );
 
         for (text, want) in [
-            ("2026-09-18 06:30", "2026-09-18T06:30:00.0000000Z"),
-            ("2026-09-18T06:30:45", "2026-09-18T06:30:45.0000000Z"),
-            ("2026-09-18 06:30:45.123", "2026-09-18T06:30:45.1230000Z"),
+            ("18.09.2026 06:30", "18.09.2026 06:30:00.0000000"),
+            ("2026-09-18 06:30", "18.09.2026 06:30:00.0000000"),
+            ("18.09.2026 06:30:45", "18.09.2026 06:30:45.0000000"),
+            ("2026-09-18T06:30:45", "18.09.2026 06:30:45.0000000"),
+            ("18.09.2026 06:30:45,123", "18.09.2026 06:30:45.1230000"),
             (
                 "2026-09-18T06:03:48.7883740Z",
-                "2026-09-18T06:03:48.7883740Z",
+                "18.09.2026 06:03:48.7883740",
             ),
-            ("18.09.2026 06:30", "2026-09-18T06:30:00.0000000Z"),
         ] {
             assert_eq!(
-                filetime_to_iso(parse_when(text, false).unwrap()),
+                filetime_to_text(parse_when(text, false).unwrap()),
                 want,
                 "{text}"
             );
@@ -799,6 +963,63 @@ mod tests {
         ] {
             assert!(parse_when(bad, false).is_err(), "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn tag_names_shorten_to_the_telling_part() {
+        let tags: Vec<(i64, String)> = [
+            "Anlage1::Zustand_DruckvorPumpe2:Archivvariable_1",
+            "Anlage1::Zustand_IstwertVentilPumpe2:Archivvariable_1",
+            "Anlage1::Zustand_DrucknachPumpe2:Archivvariable_1",
+            "Anlage1::Zustand_IstwertVentilPumpe1:Archivvariable_1",
+            "Anlage1::Parameter_SollwertDruck:Archivvariable_1",
+            "Anlage1::Fehler1:Archivvariable_1",
+            "Anlage1::Zustand_Temp_P1_LagerOben:Archivvariable_1",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i as i64 + 1, n.to_string()))
+        .collect();
+
+        let short = shorten_tag_names(&tags);
+        assert_eq!(short[&1], "DruckvorPumpe2");
+        assert_eq!(short[&2], "IstwertVentilPumpe2");
+        assert_eq!(short[&3], "DrucknachPumpe2");
+        assert_eq!(short[&4], "IstwertVentilPumpe1");
+        assert_eq!(short[&5], "SollwertDruck");
+        // A name without a category keeps all it has.
+        assert_eq!(short[&6], "Fehler1");
+        // Only the leading category goes; the rest of the path stays.
+        assert_eq!(short[&7], "Temp_P1_LagerOben");
+    }
+
+    #[test]
+    fn shortening_never_merges_two_tags() {
+        // Same name under two categories: both must stay distinguishable.
+        let tags: Vec<(i64, String)> = [
+            (1, "Anlage1::Zustand_SollwertHand:Archivvariable_1"),
+            (2, "Anlage1::Parameter_SollwertHand:Archivvariable_1"),
+            (3, "Anlage1::Zustand_Druck:Archivvariable_1"),
+        ]
+        .iter()
+        .map(|(i, n)| (*i, n.to_string()))
+        .collect();
+
+        let short = shorten_tag_names(&tags);
+        assert_eq!(short[&1], "Zustand_SollwertHand");
+        assert_eq!(short[&2], "Parameter_SollwertHand");
+        assert_eq!(short[&3], "Druck");
+        assert_ne!(short[&1], short[&2]);
+    }
+
+    #[test]
+    fn a_single_tag_keeps_its_name() {
+        let one = vec![(1, "Anlage1::Zustand_Druck:Archivvariable_1".to_string())];
+        // Nothing to compare against, so only the category is dropped.
+        assert_eq!(
+            shorten_tag_names(&one)[&1],
+            "Anlage1::Zustand_Druck:Archivvariable_1"
+        );
     }
 
     #[test]
