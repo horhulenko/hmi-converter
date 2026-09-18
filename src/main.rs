@@ -612,22 +612,11 @@ impl eframe::App for App {
         }
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.heading("HMI Log Converter");
-            ui.label(
-                egui::RichText::new("Tags.db3 + Values.db3   ->   one CSV table")
-                    .color(MUTED)
-                    .size(13.0),
-            );
-            ui.add_space(10.0);
-
-            match &self.state {
-                State::Running { .. } => self.running_view(ui),
-                State::Done(_) => self.done_view(ui),
-                State::Failed(_) => self.failed_view(ui),
-                State::Setup => self.setup_view(ui, hovering),
-            }
+        egui::Frame::central_panel(ui.style()).show(ui, |ui| match &self.state {
+            State::Running { .. } => self.running_view(ui),
+            State::Done(_) => self.done_view(ui),
+            State::Failed(_) => self.failed_view(ui),
+            State::Setup => self.setup_view(ui, hovering),
         });
 
         if matches!(self.state, State::Running { .. }) {
@@ -689,9 +678,9 @@ impl App {
 
         if !ready {
             let hint = if self.tags.is_none() && self.values.is_some() {
-                "Still missing the tag database (usually named Tags.db3)."
+                "Still missing the tag database."
             } else if self.values.is_none() && self.tags.is_some() {
-                "Still missing the value database (usually named Values.db3)."
+                "Still missing the value database."
             } else if !self.write_long && !self.write_wide {
                 "Pick at least one output table under Options."
             } else {
