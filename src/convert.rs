@@ -1,0 +1,843 @@
+//! Reading the two HMI SQLite databases and writing the CSV tables.
+//!
+//! Layout of the source data (WinCC Unified / "iseg" logging):
+//!   Tags.db3    -> LoggingTag(pk_Key, Name, ...)                one row per logged tag
+//!   Values.db3  -> LoggedProcessValue(pk_TimeStamp, pk_fk_Id, Quality, Value)
+//!                  LoggedProcessValueText / LoggedProcessValue64   same shape, other value types
+//! The join is LoggedProcessValue.pk_fk_Id == LoggingTag.pk_Key.
+//! Timestamps are Windows FILETIME: 100-nanosecond ticks since 1601-01-01 UTC.
+
+use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::time::Instant;
+
+use rusqlite::{Connection, OpenFlags};
+
+/// The three value tables we merge, in the order they are written.
+const VALUE_TABLES: [&str; 3] = [
+    "LoggedProcessValue",
+    "LoggedProcessValueText",
+    "LoggedProcessValue64",
+];
+
+pub const TAG_TABLE: &str = "LoggingTag";
+pub const MAIN_VALUE_TABLE: &str = "LoggedProcessValue";
+
+/// Quality code meaning "good" in the WinCC logs.
+const QUALITY_GOOD: i64 = 192;
+
+// ---------------------------------------------------------------- time
+
+const FILETIME_EPOCH_DIFF_SECS: i64 = 11_644_473_600; // 1601-01-01 -> 1970-01-01
+const TICKS_PER_SEC: i64 = 10_000_000;
+
+/// FILETIME ticks -> `2026-09-18T06:03:48.7883740Z`.
+pub fn filetime_to_iso(ticks: i64) -> String {
+    let secs = ticks.div_euclid(TICKS_PER_SEC) - FILETIME_EPOCH_DIFF_SECS;
+    let frac = ticks.rem_euclid(TICKS_PER_SEC);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:07}Z",
+        y,
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60,
+        frac
+    )
+}
+
+/// (year, month, day) -> days since the Unix epoch. Inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The last tick of the given day, used when only a date is typed as an upper bound.
+const TICKS_PER_DAY: i64 = 86_400 * TICKS_PER_SEC;
+
+/// Turn something a person typed into FILETIME ticks.
+///
+/// Accepted: `2026-09-18`, `18.09.2026`, either of those followed by `06:30`,
+/// `06:30:45` or `06:30:45.123`, with `T` or a space in between and an optional
+/// trailing `Z`. A bare number is taken to be raw FILETIME ticks.
+///
+/// `end_of_day` extends a date without a time to 23:59:59.9999999, which is
+/// what people mean by "until the 18th".
+pub fn parse_when(text: &str, end_of_day: bool) -> Result<i64, String> {
+    let s = text.trim().trim_end_matches(['z', 'Z']).trim();
+    if s.is_empty() {
+        return Err("empty".into());
+    }
+
+    // Raw ticks, as they appear in the pk_TimeStamp_Raw column.
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return match s.parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(n),
+            _ => Err("that number is not a timestamp".into()),
+        };
+    }
+
+    let (date_part, time_part) = match s.split_once(['T', 't', ' ']) {
+        Some((d, t)) => (d.trim(), t.trim()),
+        None => (s, ""),
+    };
+
+    let nums: Result<Vec<i64>, _> = if date_part.contains('.') {
+        date_part
+            .split('.')
+            .map(|p| p.trim().parse::<i64>())
+            .collect()
+    } else {
+        date_part
+            .split('-')
+            .map(|p| p.trim().parse::<i64>())
+            .collect()
+    };
+    let nums = nums.map_err(|_| "date should look like 2026-09-18".to_string())?;
+    let (y, mo, d) = match (nums.len(), date_part.contains('.')) {
+        (3, false) => (nums[0], nums[1], nums[2]),
+        (3, true) => (nums[2], nums[1], nums[0]), // 18.09.2026
+        _ => return Err("date should look like 2026-09-18 or 18.09.2026".into()),
+    };
+    if !(1601..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return Err("that is not a real date".into());
+    }
+
+    let mut ticks = (days_from_civil(y, mo, d) * 86_400 + FILETIME_EPOCH_DIFF_SECS) * TICKS_PER_SEC;
+
+    if time_part.is_empty() {
+        if end_of_day {
+            ticks += TICKS_PER_DAY - 1;
+        }
+        return Ok(ticks);
+    }
+
+    let (hms, frac) = match time_part.split_once([',', '.']) {
+        Some((a, b)) => (a, b),
+        None => (time_part, ""),
+    };
+    let parts: Result<Vec<i64>, _> = hms.split(':').map(|p| p.trim().parse::<i64>()).collect();
+    let parts = parts.map_err(|_| "time should look like 06:30 or 06:30:45".to_string())?;
+    let (h, mi, sec) = match parts.len() {
+        2 => (parts[0], parts[1], 0),
+        3 => (parts[0], parts[1], parts[2]),
+        _ => return Err("time should look like 06:30 or 06:30:45".into()),
+    };
+    if h > 23 || mi > 59 || sec > 59 || h < 0 || mi < 0 || sec < 0 {
+        return Err("that is not a real time".into());
+    }
+    ticks += ((h * 3600) + (mi * 60) + sec) * TICKS_PER_SEC;
+
+    if !frac.is_empty() {
+        if !frac.chars().all(|c| c.is_ascii_digit()) {
+            return Err("fractional seconds must be digits".into());
+        }
+        let mut digits = frac.to_string();
+        digits.truncate(7);
+        while digits.len() < 7 {
+            digits.push('0');
+        }
+        ticks += digits.parse::<i64>().unwrap_or(0);
+    }
+
+    Ok(ticks)
+}
+
+/// Days since the Unix epoch -> (year, month, day). Howard Hinnant civil_from_days.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+// ---------------------------------------------------------------- opening
+
+/// Open a database for reading without ever modifying the original file.
+///
+/// Plain read-only mode fails on some HMI exports because SQLite wants to
+/// replay a leftover -wal journal, so fall back to `immutable=1` and finally
+/// to a scratch copy of the file together with its -wal/-shm siblings.
+pub fn open_readonly(path: &Path) -> Result<Connection, String> {
+    let ro = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if let Ok(c) = Connection::open_with_flags(path, ro)
+        && c.prepare("SELECT 1 FROM sqlite_master LIMIT 1").is_ok()
+    {
+        tune(&c);
+        return Ok(c);
+    }
+
+    let uri = format!(
+        "file:{}?immutable=1",
+        path.to_string_lossy()
+            .replace('?', "%3f")
+            .replace('#', "%23")
+    );
+    if let Ok(c) = Connection::open_with_flags(&uri, ro | OpenFlags::SQLITE_OPEN_URI)
+        && c.prepare("SELECT 1 FROM sqlite_master LIMIT 1").is_ok()
+    {
+        tune(&c);
+        return Ok(c);
+    }
+
+    // Last resort: work on a copy, so a database still in use by the HMI converts too.
+    let scratch = std::env::temp_dir().join("hmi-converter-scratch");
+    fs::create_dir_all(&scratch).map_err(|e| format!("cannot create temp folder: {e}"))?;
+    let name = path.file_name().unwrap_or_default().to_os_string();
+    let copy = scratch.join(&name);
+    fs::copy(path, &copy).map_err(|e| format!("cannot read this file: {e}"))?;
+    for suffix in ["-wal", "-shm"] {
+        let sibling = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+        if sibling.exists() {
+            let target = scratch.join(format!("{}{}", name.to_string_lossy(), suffix));
+            let _ = fs::copy(&sibling, target);
+        }
+    }
+    let c = Connection::open(&copy).map_err(|e| format!("cannot open database: {e}"))?;
+    tune(&c);
+    Ok(c)
+}
+
+fn tune(c: &Connection) {
+    let _ = c.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536;");
+}
+
+fn table_names(conn: &Connection) -> Result<BTreeSet<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .map_err(|e| format!("not a readable SQLite database: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut out = BTreeSet::new();
+    for r in rows {
+        out.insert(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn count(conn: &Connection, table: &str) -> u64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n as u64)
+    .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------- probing
+
+/// What a single file turned out to be.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub path: PathBuf,
+    pub has_tags: bool,
+    pub has_values: bool,
+    pub tag_count: u64,
+    pub value_rows: u64,
+    pub span: Option<(String, String)>,
+}
+
+/// Inspect a file and decide, from its schema alone, which role it can play.
+pub fn probe(path: &Path) -> Result<Probe, String> {
+    let conn = open_readonly(path)?;
+    let tables = table_names(&conn)?;
+    let has_tags = tables.contains(TAG_TABLE);
+    let has_values = tables.contains(MAIN_VALUE_TABLE);
+
+    if !has_tags && !has_values {
+        return Err(format!(
+            "no HMI logging tables inside (looked for {TAG_TABLE} and {MAIN_VALUE_TABLE})"
+        ));
+    }
+
+    let tag_count = if has_tags { count(&conn, TAG_TABLE) } else { 0 };
+    let mut value_rows = 0;
+    let mut span = None;
+    if has_values {
+        for t in VALUE_TABLES {
+            if tables.contains(t) {
+                value_rows += count(&conn, t);
+            }
+        }
+        let bounds = conn.query_row(
+            &format!("SELECT MIN(pk_TimeStamp), MAX(pk_TimeStamp) FROM \"{MAIN_VALUE_TABLE}\""),
+            [],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        );
+        if let Ok((Some(lo), Some(hi))) = bounds {
+            span = Some((filetime_to_iso(lo), filetime_to_iso(hi)));
+        }
+    }
+
+    Ok(Probe {
+        path: path.to_path_buf(),
+        has_tags,
+        has_values,
+        tag_count,
+        value_rows,
+        span,
+    })
+}
+
+// ---------------------------------------------------------------- time range
+
+/// An inclusive time window, in FILETIME ticks. `None` means "no limit".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Range {
+    pub from: Option<i64>,
+    pub until: Option<i64>,
+}
+
+impl Range {
+    pub fn is_open(&self) -> bool {
+        self.from.is_none() && self.until.is_none()
+    }
+
+    /// The SQL that restricts a value table to this window.
+    /// The bounds are plain integers, so there is nothing to escape.
+    fn where_sql(&self) -> String {
+        match (self.from, self.until) {
+            (None, None) => String::new(),
+            (Some(a), None) => format!(" WHERE pk_TimeStamp >= {a}"),
+            (None, Some(b)) => format!(" WHERE pk_TimeStamp <= {b}"),
+            (Some(a), Some(b)) => format!(" WHERE pk_TimeStamp >= {a} AND pk_TimeStamp <= {b}"),
+        }
+    }
+}
+
+/// How much data a time window would keep. Drives the live preview in the window.
+#[derive(Clone, Debug, Default)]
+pub struct Kept {
+    pub rows: u64,
+    pub timestamps: u64,
+    pub total_rows: u64,
+    pub span: Option<(String, String)>,
+}
+
+/// Count what a time window would keep, without writing anything.
+pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
+    let conn = open_readonly(values_db)?;
+    let present = table_names(&conn)?;
+    let used: Vec<&str> = VALUE_TABLES
+        .iter()
+        .copied()
+        .filter(|t| present.contains(*t))
+        .collect();
+    if used.is_empty() {
+        return Err(format!("no {MAIN_VALUE_TABLE} table"));
+    }
+
+    let total_rows: u64 = used.iter().map(|t| count(&conn, t)).sum();
+    let where_sql = range.where_sql();
+    let inner = used
+        .iter()
+        .map(|t| format!("SELECT pk_TimeStamp FROM \"{t}\"{where_sql}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!(
+        "SELECT COUNT(*), COUNT(DISTINCT pk_TimeStamp), MIN(pk_TimeStamp), MAX(pk_TimeStamp) \
+         FROM ({inner})"
+    );
+
+    let (rows, timestamps, lo, hi) = conn
+        .query_row(&sql, [], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(Kept {
+        rows,
+        timestamps,
+        total_rows,
+        span: match (lo, hi) {
+            (Some(a), Some(b)) => Some((filetime_to_iso(a), filetime_to_iso(b))),
+            _ => None,
+        },
+    })
+}
+
+// ---------------------------------------------------------------- job
+
+pub struct Job {
+    pub tags_db: PathBuf,
+    pub values_db: PathBuf,
+    pub out_dir: PathBuf,
+    pub base_name: String,
+    pub semicolon: bool,
+    pub write_long: bool,
+    pub write_wide: bool,
+    /// Only values inside this window are written.
+    pub range: Range,
+}
+
+#[derive(Debug)]
+pub enum Progress {
+    Stage(String),
+    Rows { done: u64, total: u64 },
+    Finished(Box<Summary>),
+    Failed(String),
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Summary {
+    /// Written file and how many data rows it holds.
+    pub files: Vec<(PathBuf, u64)>,
+    pub rows: u64,
+    pub timestamps: u64,
+    pub tags_used: usize,
+    pub tags_total: usize,
+    pub unknown_ids: Vec<i64>,
+    pub bad_quality: u64,
+    pub span: Option<(String, String)>,
+    pub secs: f32,
+}
+
+/// Append one CSV field, quoting it only when it has to be quoted.
+fn field(out: &mut String, s: &str, delim: char) {
+    if s.contains(delim) || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        out.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    } else {
+        out.push_str(s);
+    }
+}
+
+/// Run the whole conversion, reporting progress as it goes.
+pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result<Summary, String> {
+    let started = Instant::now();
+    let delim = if job.semicolon { ';' } else { ',' };
+    let say = |s: &str| {
+        let _ = tx.send(Progress::Stage(s.to_string()));
+    };
+
+    // -- 1. tag names ------------------------------------------------------
+    say("Reading tag names");
+    let tags = open_readonly(&job.tags_db)?;
+    let mut names: HashMap<i64, String> = HashMap::new();
+    {
+        // When a tag has several configuration versions the newest name wins.
+        let sql = format!("SELECT pk_Key, Name FROM \"{TAG_TABLE}\" ORDER BY pk_StartTime");
+        let mut stmt = tags
+            .prepare(&sql)
+            .map_err(|e| format!("{TAG_TABLE}: {e}"))?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let key: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let name: Option<String> = row.get(1).map_err(|e| e.to_string())?;
+            if let Some(name) = name {
+                names.insert(key, name);
+            }
+        }
+    }
+    let tags_total = names.len();
+
+    // -- 2. find out what the value database actually holds -----------------
+    say("Scanning logged values");
+    let vals = open_readonly(&job.values_db)?;
+    let present = table_names(&vals)?;
+    let used: Vec<&str> = VALUE_TABLES
+        .iter()
+        .copied()
+        .filter(|t| present.contains(*t))
+        .collect();
+    if used.is_empty() {
+        return Err(format!(
+            "{} holds no {MAIN_VALUE_TABLE} table",
+            job.values_db.display()
+        ));
+    }
+
+    // Everything below counts and reads only the chosen time window.
+    let where_sql = job.range.where_sql();
+    let total: u64 = used
+        .iter()
+        .map(|t| {
+            vals.query_row(
+                &format!("SELECT COUNT(*) FROM \"{t}\"{where_sql}"),
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .unwrap_or(0)
+        })
+        .sum();
+    if total == 0 {
+        return Err(if job.range.is_open() {
+            "the value database contains no logged values".into()
+        } else {
+            "no logged values fall inside the chosen time range".to_string()
+        });
+    }
+
+    // Column order of the wide table: every tag id that really occurs in the window.
+    let mut id_set: BTreeSet<i64> = BTreeSet::new();
+    for t in &used {
+        let mut stmt = vals
+            .prepare(&format!("SELECT DISTINCT pk_fk_Id FROM \"{t}\"{where_sql}"))
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            id_set.insert(r.get(0).map_err(|e| e.to_string())?);
+        }
+    }
+    let ids: Vec<i64> = id_set.into_iter().collect();
+    let col_of: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let unknown_ids: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !names.contains_key(id))
+        .collect();
+    let header_name = |id: i64| -> String {
+        names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("id_{id}"))
+    };
+
+    // -- 3. output files ---------------------------------------------------
+    fs::create_dir_all(&job.out_dir).map_err(|e| format!("cannot create output folder: {e}"))?;
+    let long_path = job.out_dir.join(format!("{}_long.csv", job.base_name));
+    let wide_path = job.out_dir.join(format!("{}_wide.csv", job.base_name));
+
+    let mut long = if job.write_long {
+        let f = fs::File::create(&long_path)
+            .map_err(|e| format!("cannot write {}: {e}", long_path.display()))?;
+        Some(BufWriter::with_capacity(1 << 20, f))
+    } else {
+        None
+    };
+    let mut wide = if job.write_wide {
+        let f = fs::File::create(&wide_path)
+            .map_err(|e| format!("cannot write {}: {e}", wide_path.display()))?;
+        Some(BufWriter::with_capacity(1 << 20, f))
+    } else {
+        None
+    };
+
+    let mut line = String::with_capacity(256);
+    if let Some(w) = long.as_mut() {
+        line.clear();
+        let headers = [
+            "pk_TimeStamp",
+            "pk_TimeStamp_Raw",
+            "pk_fk_Id",
+            "Value",
+            "Name",
+            "Quality",
+        ];
+        for (i, h) in headers.iter().enumerate() {
+            if i > 0 {
+                line.push(delim);
+            }
+            field(&mut line, h, delim);
+        }
+        line.push('\n');
+        w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    if let Some(w) = wide.as_mut() {
+        line.clear();
+        field(&mut line, "pk_TimeStamp", delim);
+        line.push(delim);
+        field(&mut line, "pk_TimeStamp_Raw", delim);
+        for id in &ids {
+            line.push(delim);
+            field(&mut line, &header_name(*id), delim);
+        }
+        line.push('\n');
+        w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    // -- 4. one sorted pass over every value table -------------------------
+    say("Converting");
+    let sql = used
+        .iter()
+        .map(|t| format!("SELECT pk_TimeStamp, pk_fk_Id, Quality, Value FROM \"{t}\"{where_sql}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+        + " ORDER BY pk_TimeStamp, pk_fk_Id";
+    let mut stmt = vals.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+
+    let mut done: u64 = 0;
+    let mut timestamps: u64 = 0;
+    let mut bad_quality: u64 = 0;
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: i64 = 0;
+
+    // The wide table is streamed as well: rows arrive sorted by timestamp, so a
+    // group is complete as soon as a different timestamp shows up.
+    let mut bucket: Vec<String> = vec![String::new(); ids.len()];
+    let mut bucket_ts: Option<(i64, String)> = None;
+
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let ts: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let id: i64 = row.get(1).map_err(|e| e.to_string())?;
+        let quality: i64 = row.get(2).unwrap_or(-1);
+        let value = match row.get_ref(3).map_err(|e| e.to_string())? {
+            rusqlite::types::ValueRef::Null => String::new(),
+            rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+            rusqlite::types::ValueRef::Real(f) => f.to_string(),
+            rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+            rusqlite::types::ValueRef::Blob(b) => {
+                let mut s = String::with_capacity(2 + b.len() * 2);
+                s.push_str("0x");
+                for byte in b {
+                    s.push_str(&format!("{byte:02x}"));
+                }
+                s
+            }
+        };
+
+        if quality != QUALITY_GOOD {
+            bad_quality += 1;
+        }
+        if first_ts.is_none() {
+            first_ts = Some(ts);
+        }
+        last_ts = ts;
+
+        // A timestamp is shared by ~100 consecutive rows, so format it once.
+        let iso = match &bucket_ts {
+            Some((t, iso)) if *t == ts => iso.clone(),
+            _ => filetime_to_iso(ts),
+        };
+
+        if let Some(w) = long.as_mut() {
+            line.clear();
+            field(&mut line, &iso, delim);
+            line.push(delim);
+            field(&mut line, &ts.to_string(), delim);
+            line.push(delim);
+            field(&mut line, &id.to_string(), delim);
+            line.push(delim);
+            field(&mut line, &value, delim);
+            line.push(delim);
+            field(&mut line, &header_name(id), delim);
+            line.push(delim);
+            field(&mut line, &quality.to_string(), delim);
+            line.push('\n');
+            w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
+        match &bucket_ts {
+            Some((t, _)) if *t == ts => {}
+            Some(prev) => {
+                if let Some(w) = wide.as_mut() {
+                    flush_bucket(w, &mut line, &mut bucket, prev, delim)?;
+                }
+                timestamps += 1;
+                bucket_ts = Some((ts, iso));
+            }
+            None => bucket_ts = Some((ts, iso)),
+        }
+        if let Some(col) = col_of.get(&id) {
+            bucket[*col] = value;
+        }
+
+        done += 1;
+        if done.is_multiple_of(8192) {
+            let _ = tx.send(Progress::Rows { done, total });
+        }
+    }
+
+    if let Some(prev) = &bucket_ts {
+        if let Some(w) = wide.as_mut() {
+            flush_bucket(w, &mut line, &mut bucket, prev, delim)?;
+        }
+        timestamps += 1;
+    }
+
+    say("Writing files to disk");
+    let mut files = Vec::new();
+    if let Some(mut w) = long {
+        w.flush().map_err(|e| e.to_string())?;
+        files.push((long_path, done));
+    }
+    if let Some(mut w) = wide {
+        w.flush().map_err(|e| e.to_string())?;
+        files.push((wide_path, timestamps));
+    }
+    let _ = tx.send(Progress::Rows { done, total });
+
+    Ok(Summary {
+        files,
+        rows: done,
+        timestamps,
+        tags_used: ids.len(),
+        tags_total,
+        unknown_ids,
+        bad_quality,
+        span: first_ts.map(|f| (filetime_to_iso(f), filetime_to_iso(last_ts))),
+        secs: started.elapsed().as_secs_f32(),
+    })
+}
+
+/// Write one finished timestamp group of the wide table and reset the buffer.
+fn flush_bucket(
+    w: &mut BufWriter<fs::File>,
+    line: &mut String,
+    bucket: &mut [String],
+    ts: &(i64, String),
+    delim: char,
+) -> Result<(), String> {
+    line.clear();
+    field(line, &ts.1, delim);
+    line.push(delim);
+    field(line, &ts.0.to_string(), delim);
+    for cell in bucket.iter_mut() {
+        line.push(delim);
+        field(line, cell, delim);
+        cell.clear();
+    }
+    line.push('\n');
+    w.write_all(line.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filetime_matches_known_points() {
+        // 1601-01-01 is tick zero.
+        assert_eq!(filetime_to_iso(0), "1601-01-01T00:00:00.0000000Z");
+        // 1970-01-01, the Unix epoch.
+        assert_eq!(
+            filetime_to_iso(FILETIME_EPOCH_DIFF_SECS * TICKS_PER_SEC),
+            "1970-01-01T00:00:00.0000000Z"
+        );
+        // A real row out of Values.db3.
+        assert_eq!(
+            filetime_to_iso(134_341_850_287_883_740),
+            "2026-09-18T06:03:48.7883740Z"
+        );
+        // A leap day, to exercise the calendar maths.
+        assert_eq!(
+            filetime_to_iso(133_536_384_000_000_000),
+            "2024-02-29T00:00:00.0000000Z"
+        );
+    }
+
+    #[test]
+    fn typed_dates_round_trip() {
+        let day = parse_when("2026-09-18", false).unwrap();
+        assert_eq!(filetime_to_iso(day), "2026-09-18T00:00:00.0000000Z");
+
+        // The same day written the German way.
+        assert_eq!(parse_when("18.09.2026", false).unwrap(), day);
+
+        // An upper bound given as a bare date covers the whole day.
+        assert_eq!(
+            filetime_to_iso(parse_when("2026-09-18", true).unwrap()),
+            "2026-09-18T23:59:59.9999999Z"
+        );
+
+        for (text, want) in [
+            ("2026-09-18 06:30", "2026-09-18T06:30:00.0000000Z"),
+            ("2026-09-18T06:30:45", "2026-09-18T06:30:45.0000000Z"),
+            ("2026-09-18 06:30:45.123", "2026-09-18T06:30:45.1230000Z"),
+            (
+                "2026-09-18T06:03:48.7883740Z",
+                "2026-09-18T06:03:48.7883740Z",
+            ),
+            ("18.09.2026 06:30", "2026-09-18T06:30:00.0000000Z"),
+        ] {
+            assert_eq!(
+                filetime_to_iso(parse_when(text, false).unwrap()),
+                want,
+                "{text}"
+            );
+        }
+
+        // Raw ticks, as copied out of the pk_TimeStamp_Raw column.
+        assert_eq!(
+            parse_when("134341850287883740", false).unwrap(),
+            134_341_850_287_883_740
+        );
+
+        for bad in [
+            "",
+            "yesterday",
+            "2026-13-01",
+            "2026-09-18 25:00",
+            "18/09/2026",
+        ] {
+            assert!(parse_when(bad, false).is_err(), "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn range_sql_is_inclusive() {
+        assert_eq!(Range::default().where_sql(), "");
+        assert_eq!(
+            Range {
+                from: Some(5),
+                until: None
+            }
+            .where_sql(),
+            " WHERE pk_TimeStamp >= 5"
+        );
+        assert_eq!(
+            Range {
+                from: Some(5),
+                until: Some(9)
+            }
+            .where_sql(),
+            " WHERE pk_TimeStamp >= 5 AND pk_TimeStamp <= 9"
+        );
+    }
+
+    #[test]
+    fn fields_are_quoted_only_when_needed() {
+        let mut s = String::new();
+        field(&mut s, "plain", ',');
+        assert_eq!(s, "plain");
+
+        s.clear();
+        field(&mut s, "a,b", ',');
+        assert_eq!(s, "\"a,b\"");
+
+        s.clear();
+        field(&mut s, "a,b", ';');
+        assert_eq!(s, "a,b");
+
+        s.clear();
+        field(&mut s, "say \"hi\"", ',');
+        assert_eq!(s, "\"say \"\"hi\"\"\"");
+    }
+}
