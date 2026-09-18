@@ -86,10 +86,22 @@ pub struct ChartSummary {
     pub secs: f32,
 }
 
-/// One tag and its readings.
-struct Series {
-    name: String,
-    points: Vec<(i64, f64)>,
+/// One tag and its readings, in milliseconds since 1970.
+pub struct Series {
+    pub name: String,
+    pub points: Vec<(i64, f64)>,
+}
+
+/// Everything read out of the databases, ready to be drawn either way.
+pub struct Loaded {
+    pub series: Vec<Series>,
+    /// Points read, and points left after thinning.
+    pub read: u64,
+    pub drawn: u64,
+    /// Tags whose values are text, which cannot go on an axis.
+    pub skipped_text: usize,
+    pub first_ms: i64,
+    pub last_ms: i64,
 }
 
 /// Largest-Triangle-Three-Buckets: drop points but keep the shape, so a thinned
@@ -157,13 +169,12 @@ fn json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Read the values, thin them, and write the page.
-pub fn build(
+/// Read the values out of the databases and thin them to the chosen detail.
+pub fn load(
     job: &ChartJob,
     tx: &Sender<Progress>,
     cancel: &Arc<AtomicBool>,
-) -> Result<ChartSummary, String> {
-    let started = Instant::now();
+) -> Result<Loaded, String> {
     let say = |s: &str| {
         let _ = tx.send(Progress::Stage(s.to_string()));
     };
@@ -293,8 +304,33 @@ pub fn build(
     }
     let drawn: u64 = series.iter().map(|s| s.points.len() as u64).sum();
 
-    // -- the page ----------------------------------------------------------
-    say("Writing the page");
+    Ok(Loaded {
+        series,
+        read,
+        drawn,
+        skipped_text,
+        first_ms,
+        last_ms,
+    })
+}
+
+/// Read the values and write the self-contained page.
+pub fn build(
+    job: &ChartJob,
+    tx: &Sender<Progress>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ChartSummary, String> {
+    let started = Instant::now();
+    let Loaded {
+        series,
+        read,
+        drawn,
+        skipped_text,
+        first_ms,
+        last_ms,
+    } = load(job, tx, cancel)?;
+
+    let _ = tx.send(Progress::Stage("Writing the page".into()));
     let mut payload = String::with_capacity(drawn as usize * 18 + 1024);
     payload.push_str("{\"from\":");
     payload.push_str(&first_ms.to_string());

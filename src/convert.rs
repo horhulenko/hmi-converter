@@ -232,6 +232,15 @@ pub fn shorten_tag_names(names: &[(i64, String)]) -> HashMap<i64, String> {
         .collect()
 }
 
+/// Drop whatever every one of these names has in common, for reading in tight
+/// places. Unlike [`shorten_tag_names`] the category is kept, so this can never
+/// make two names look alike, and running it twice changes nothing.
+pub fn trim_common(names: &[String]) -> Vec<String> {
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (pre, suf) = common_affixes(&borrowed);
+    borrowed.iter().map(|n| core_of(n, pre, suf)).collect()
+}
+
 fn tally(names: &[String]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for n in names {
@@ -1073,6 +1082,26 @@ mod tests {
         ] {
             assert!(parse_when(bad, false).is_err(), "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn trimming_leaves_the_part_that_differs() {
+        let names: Vec<String> = [
+            "Anlage1::Zustand_DruckvorPumpe2:Archivvariable_1",
+            "Anlage1::Zustand_DrucknachPumpe2:Archivvariable_1",
+            "Anlage1::Parameter_SollwertDruck:Archivvariable_1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let once = trim_common(&names);
+        assert_eq!(once[0], "Zustand_DruckvorPumpe2");
+        assert_eq!(once[1], "Zustand_DrucknachPumpe2");
+        assert_eq!(once[2], "Parameter_SollwertDruck");
+
+        // Doing it again must not eat into the names.
+        assert_eq!(trim_common(&once), once);
     }
 
     #[test]

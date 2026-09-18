@@ -6,6 +6,7 @@
 
 mod chart;
 mod convert;
+mod plotview;
 mod theme;
 
 use std::path::{Path, PathBuf};
@@ -14,13 +15,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use chart::{ChartJob, ChartSummary, Detail};
+use chart::{ChartJob, ChartSummary, Detail, Loaded};
 use convert::{Column, Job, Kept, OutColumn, Probe, Progress, Range, Summary};
 use eframe::egui;
+use plotview::PlotView;
 use theme::{ACCENT, BAD, DIM, MUTED, OK, TEXT, WARN, body, dot, lead, muted, strong};
 
 /// A counting request answered on a worker thread: which request, and its result.
 type CountReply = (u64, Result<Kept, String>);
+
+/// Values read for the chart drawn in this window.
+type PlotReply = Result<Loaded, String>;
 
 /// A finished chart on its way back from the worker thread.
 type ChartReply = Result<ChartSummary, String>;
@@ -394,6 +399,8 @@ enum State {
     Done(Box<Summary>),
     /// A chart page was written and handed to the browser.
     Charted(Box<ChartSummary>),
+    /// The chart drawn in this window.
+    Plotting(Box<PlotView>),
     Failed(String),
 }
 
@@ -424,6 +431,8 @@ struct App {
     detail: Detail,
     /// A finished chart waiting to be reported, from the worker thread.
     chart_done: (Sender<ChartReply>, Receiver<ChartReply>),
+    /// Values read for the chart in this window.
+    plot_done: (Sender<PlotReply>, Receiver<PlotReply>),
     /// Every column of the long table, in order, as the user has arranged them.
     long_columns: Vec<ColumnRow>,
     /// Whether the column chooser is open.
@@ -463,6 +472,7 @@ impl App {
             shorten_names: false,
             detail: Detail::Balanced,
             chart_done: channel(),
+            plot_done: channel(),
             long_columns: last.column_rows(),
             columns_open: false,
             drag: None,
@@ -781,20 +791,19 @@ impl App {
         };
     }
 
-    /// Build the chart page on a worker, then hand it to the browser.
-    fn start_chart(&mut self) {
+    /// What to read, for either way of charting.
+    fn chart_job(&mut self) -> Option<ChartJob> {
         let (Some(tags), Some(values)) = (&self.tags, &self.values) else {
-            return;
+            return None;
         };
         let range = match self.range() {
             Ok(r) => r,
             Err(e) => {
                 self.state = State::Failed(e);
-                return;
+                return None;
             }
         };
-
-        let job = ChartJob {
+        Some(ChartJob {
             tags_db: tags.path.clone(),
             values_db: values.path.clone(),
             out_dir: self.out_dir(),
@@ -802,7 +811,12 @@ impl App {
             range,
             shorten_names: self.shorten_names,
             detail: self.detail,
-        };
+        })
+    }
+
+    /// Build the chart page on a worker, then hand it to the browser.
+    fn start_chart(&mut self) {
+        let Some(job) = self.chart_job() else { return };
 
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -810,6 +824,27 @@ impl App {
         let done = self.chart_done.0.clone();
         thread::spawn(move || {
             let _ = done.send(chart::build(&job, &tx, &worker_cancel));
+        });
+
+        self.notes.clear();
+        self.state = State::Running {
+            rx,
+            cancel,
+            stage: "Starting".into(),
+            done: 0,
+            total: 0,
+        };
+    }
+
+    /// Read the values for the chart drawn in this window.
+    fn start_plot(&mut self) {
+        let Some(job) = self.chart_job() else { return };
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let done = self.plot_done.0.clone();
+        thread::spawn(move || {
+            let _ = done.send(chart::load(&job, &tx, &worker_cancel));
         });
 
         self.notes.clear();
@@ -850,6 +885,13 @@ impl App {
 
         // A chart reports on its own channel, because it produces a page
         // rather than a pair of tables.
+        while let Ok(result) = self.plot_done.1.try_recv() {
+            self.state = match result {
+                Ok(data) => State::Plotting(Box::new(PlotView::new(data))),
+                Err(e) => State::Failed(e),
+            };
+        }
+
         while let Ok(result) = self.chart_done.1.try_recv() {
             self.state = match result {
                 Ok(summary) => {
@@ -901,6 +943,7 @@ impl eframe::App for App {
                     State::Running { .. } => self.running_view(ui),
                     State::Done(_) => self.done_view(ui),
                     State::Charted(_) => self.chart_view(ui),
+                    State::Plotting(_) => self.plot_view(ui),
                     State::Failed(_) => self.failed_view(ui),
                     State::Setup => self.setup_view(ui, hovering),
                 });
@@ -1316,29 +1359,47 @@ impl App {
         let ready = self.ready();
         let can_chart = self.tags.is_some() && self.values.is_some() && self.range().is_ok();
         let width = ui.available_width();
-        let chart_width = 220.0_f32.min(width * 0.32);
+        let chart_width = 150.0_f32.min(width * 0.22);
 
         ui.horizontal(|ui| {
             let label = theme::on_accent("Convert to CSV", ready);
             let button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
-                .min_size(egui::vec2(width - chart_width - 8.0, 42.0))
+                .min_size(egui::vec2(width - chart_width * 2.0 - 16.0, 42.0))
                 .fill(theme::button_fill(ready));
             if ui.add_enabled(ready, button).clicked() {
                 self.start();
             }
 
-            let label = if can_chart {
-                body("Open charts")
-            } else {
-                body("Open charts").color(DIM)
+            let label = |text: &'static str| {
+                if can_chart {
+                    body(text)
+                } else {
+                    body(text).color(DIM)
+                }
             };
-            let button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
-                .min_size(egui::vec2(chart_width, 42.0));
+
+            let here =
+                egui::Button::new((egui::Atom::grow(), label("Chart here"), egui::Atom::grow()))
+                    .min_size(egui::vec2(chart_width, 42.0));
             if ui
-                .add_enabled(can_chart, button)
+                .add_enabled(can_chart, here)
                 .on_hover_text(
-                    "Draw the values in the browser: eleven kinds of chart, \
-                     tags on and off as you watch. Nothing is downloaded.",
+                    "Draw the values in this window: pan, zoom and switch tags \
+                     with no waiting.",
+                )
+                .clicked()
+            {
+                self.start_plot();
+            }
+
+            let browser =
+                egui::Button::new((egui::Atom::grow(), label("In browser"), egui::Atom::grow()))
+                    .min_size(egui::vec2(chart_width, 42.0));
+            if ui
+                .add_enabled(can_chart, browser)
+                .on_hover_text(
+                    "Write one self-contained page and open it: eleven kinds of \
+                     chart, nothing downloaded.",
                 )
                 .clicked()
             {
@@ -1519,7 +1580,13 @@ impl App {
                 reveal(p);
             }
             if ui
-                .add(egui::Button::new("Open charts").min_size(egui::vec2(150.0, 36.0)))
+                .add(egui::Button::new("Chart here").min_size(egui::vec2(130.0, 36.0)))
+                .clicked()
+            {
+                self.start_plot();
+            }
+            if ui
+                .add(egui::Button::new("In browser").min_size(egui::vec2(130.0, 36.0)))
                 .clicked()
             {
                 self.start_chart();
@@ -1532,6 +1599,41 @@ impl App {
                 self.notes.clear();
             }
         });
+    }
+
+    /// The chart inside this window, with a bar to leave it by.
+    fn plot_view(&mut self, ui: &mut egui::Ui) {
+        let mut leave = false;
+        let mut to_browser = false;
+        if let State::Plotting(view) = &mut self.state {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Back").min_size(egui::vec2(90.0, 28.0)))
+                    .clicked()
+                {
+                    leave = true;
+                }
+                ui.label(theme::lead("Charts"));
+                ui.label(muted(view.caption()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Open in browser")
+                        .on_hover_text("The same values as a page, with more kinds of chart")
+                        .clicked()
+                    {
+                        to_browser = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            view.ui(ui);
+        }
+        if leave {
+            self.state = State::Setup;
+        }
+        if to_browser {
+            self.start_chart();
+        }
     }
 
     /// What was drawn, and where the page went.
@@ -2002,7 +2104,7 @@ fn stem_of(p: &Path) -> String {
 }
 
 /// 602912 -> "602 912"
-fn sep(n: u64) -> String {
+pub fn sep(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -2032,7 +2134,20 @@ fn human_size(p: &Path) -> String {
     human_bytes(md.len())
 }
 
-fn elide(s: &str, max: usize) -> String {
+/// Shorten from the end, keeping the front. Names are told apart by how they
+/// begin, so this is the way round to cut them.
+pub fn elide_end(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    format!(
+        "{}...",
+        chars[..max.saturating_sub(3)].iter().collect::<String>()
+    )
+}
+
+pub fn elide(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         return s.to_string();
@@ -2081,6 +2196,13 @@ mod tests {
         assert_eq!(sep(1_000), "1 000");
         assert_eq!(sep(602_912), "602 912");
         assert_eq!(sep(1_234_567), "1 234 567");
+    }
+
+    #[test]
+    fn names_are_shortened_from_the_right() {
+        assert_eq!(elide_end("short", 20), "short");
+        // What tells two tags apart is at the front, so the front survives.
+        assert_eq!(elide_end("Zustand_DruckvorPumpe2", 14), "Zustand_Dru...");
     }
 
     #[test]
