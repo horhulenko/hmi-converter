@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 812.0])
+            .with_inner_size([880.0, 690.0])
             .with_min_inner_size([560.0, 520.0])
             .with_drag_and_drop(true)
             .with_title("HMI Log Converter"),
@@ -692,13 +692,19 @@ impl eframe::App for App {
 impl App {
     // -- choosing files and options ---------------------------------------
     fn setup_view(&mut self, ui: &mut egui::Ui, hovering: bool) {
+        // Two cards per row: what comes in on the left, what goes out on the
+        // right, so the whole job fits on one screen without scrolling.
         self.drop_zone(ui, hovering);
         ui.add_space(theme::GAP);
-        self.files_view(ui);
+        ui.columns(2, |c| {
+            self.files_view(&mut c[0]);
+            self.range_view(&mut c[1]);
+        });
         ui.add_space(theme::GAP);
-        self.range_view(ui);
-        ui.add_space(theme::GAP);
-        self.output_view(ui);
+        ui.columns(2, |c| {
+            self.output_view(&mut c[0]);
+            self.options_view(&mut c[1]);
+        });
         self.notes_view(ui);
     }
 
@@ -742,6 +748,9 @@ impl App {
         let values = self.values.clone();
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.set_min_height(theme::ROW_TOP);
+            section(ui, "Databases", "");
+            ui.add_space(theme::GAP);
             slot_row(
                 ui,
                 "Tag names",
@@ -757,7 +766,7 @@ impl App {
                 "waiting for the database that holds LoggedProcessValue",
                 |p| match p.span {
                     Some((a, b)) => format!(
-                        "{} rows    {}  to  {}",
+                        "{} rows\n{}  to  {}",
                         sep(p.value_rows),
                         convert::filetime_to_short(a),
                         convert::filetime_to_short(b)
@@ -772,7 +781,8 @@ impl App {
     fn range_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section(ui, "Time range", "optional -- empty means everything");
+            ui.set_min_height(theme::ROW_TOP);
+            section(ui, "Time range", "optional");
             ui.add_space(theme::GAP);
 
             let last_from = self.last.from.clone();
@@ -832,6 +842,7 @@ impl App {
     fn output_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.set_min_height(theme::ROW_BOTTOM);
             section(ui, "Save to", "");
             ui.add_space(theme::GAP);
 
@@ -841,7 +852,7 @@ impl App {
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut name)
-                            .desired_width(220.0)
+                            .desired_width(150.0)
                             .hint_text("file name"),
                     )
                     .changed()
@@ -863,7 +874,7 @@ impl App {
                 match self.chosen_dir() {
                     Some(dir) => {
                         if ui
-                            .link(muted(elide(&dir.display().to_string(), 52)))
+                            .link(muted(elide(&dir.display().to_string(), 38)))
                             .on_hover_text(format!(
                                 "{}\n\nClick to open in Explorer",
                                 dir.display()
@@ -884,36 +895,34 @@ impl App {
             if self.output_files().is_empty() {
                 ui.label(body("Pick at least one table below.").color(WARN));
             }
-
-            ui.add_space(theme::GAP);
-            self.options_view(ui);
         });
     }
 
+    /// What the CSV files are to contain.
     fn options_view(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.write_long, "Long table -- one row per value");
-        ui.checkbox(
-            &mut self.write_wide,
-            "Wide table -- one row per timestamp, one column per tag",
-        );
-        ui.checkbox(
-            &mut self.semicolon,
-            "Separate with ;  (Excel with a comma decimal mark)",
-        );
-        ui.checkbox(&mut self.shorten_names, "Shorten tag names");
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(theme::ROW_BOTTOM);
+            section(ui, "What to write", "");
+            ui.add_space(theme::GAP);
+            ui.checkbox(&mut self.write_long, "Long table -- a row per value");
+            ui.checkbox(&mut self.write_wide, "Wide table -- a column per tag");
+            ui.checkbox(&mut self.semicolon, "Separate with ;  (for Excel)");
+            ui.checkbox(&mut self.shorten_names, "Shorten tag names");
 
-        if self.shorten_names {
-            ui.add_space(2.0);
-            ui.indent("shorten_example", |ui| match self.shorten_example() {
-                Some((full, short)) => {
-                    ui.label(muted(full.to_string()));
-                    ui.label(muted(format!("becomes   {short}")).color(OK));
+            if self.shorten_names {
+                ui.add_space(4.0);
+                match self.shorten_example() {
+                    Some((full, short)) => {
+                        ui.label(muted(full));
+                        ui.label(muted(format!("becomes   {short}")).color(OK));
+                    }
+                    None => {
+                        ui.label(muted("Load the tag database to see an example."));
+                    }
                 }
-                None => {
-                    ui.label(muted("Load the tag database to see an example."));
-                }
-            });
-        }
+            }
+        });
     }
 
     /// One real tag, before and after shortening, so the option is not a guess.
@@ -1261,7 +1270,7 @@ fn slot_row(
 /// button, and the exact instant it resolves to.
 fn range_field(ui: &mut egui::Ui, label: &str, text: &mut String, last: &str, end_of_day: bool) {
     ui.horizontal(|ui| {
-        ui.add_sized([44.0, 18.0], egui::Label::new(body(label)));
+        ui.add_sized([40.0, 18.0], egui::Label::new(body(label)));
 
         let hint = if last.trim().is_empty() {
             "18.09.2026 06:30".to_string()
@@ -1271,29 +1280,33 @@ fn range_field(ui: &mut egui::Ui, label: &str, text: &mut String, last: &str, en
         ui.add(
             egui::TextEdit::singleline(text)
                 .hint_text(hint)
-                .desired_width(190.0),
+                .desired_width(146.0),
         );
 
         if !last.trim().is_empty()
             && text.trim() != last.trim()
             && ui
-                .button("Use last")
+                .small_button("Use last")
                 .on_hover_text(format!("Paste what was used last time: {}", last.trim()))
                 .clicked()
         {
             *text = last.trim().to_string();
         }
-        if !text.is_empty() && ui.button("Clear").clicked() {
+        if !text.is_empty() && ui.small_button("Clear").clicked() {
             text.clear();
         }
+    });
 
-        if !text.trim().is_empty() {
+    // The instant it resolves to, on its own line so the row stays narrow.
+    if !text.trim().is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(44.0);
             match convert::parse_when(text, end_of_day) {
                 Ok(t) => ui.label(muted(format!("= {}", convert::filetime_to_text(t)))),
                 Err(e) => ui.label(muted(e).color(BAD)),
             };
-        }
-    });
+        });
+    }
 }
 
 // ---------------------------------------------------------------- helpers
