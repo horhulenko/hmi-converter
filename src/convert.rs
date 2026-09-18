@@ -360,7 +360,7 @@ fn tune(c: &Connection) {
     let _ = c.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536;");
 }
 
-fn table_names(conn: &Connection) -> Result<BTreeSet<String>, String> {
+pub fn table_names(conn: &Connection) -> Result<BTreeSet<String>, String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
         .map_err(|e| format!("not a readable SQLite database: {e}"))?;
@@ -449,7 +449,7 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
 
 /// Every tag id and its configured name. When a tag has several configuration
 /// versions the newest name wins.
-fn read_tag_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
+pub fn read_tag_names(conn: &Connection) -> Result<Vec<(i64, String)>, String> {
     let sql = format!("SELECT pk_Key, Name FROM \"{TAG_TABLE}\" ORDER BY pk_StartTime");
     let mut stmt = conn
         .prepare(&sql)
@@ -492,6 +492,16 @@ impl Range {
             (Some(a), Some(b)) => format!(" WHERE pk_TimeStamp >= {a} AND pk_TimeStamp <= {b}"),
         }
     }
+}
+
+/// The SQL that restricts a value table to a window, shared with the charts.
+pub fn range_where(range: Range) -> String {
+    range.where_sql()
+}
+
+/// Milliseconds since 1970 -> FILETIME ticks, the inverse of the chart's clock.
+pub fn ms_to_ticks(ms: i64) -> i64 {
+    (ms + 11_644_473_600_000) * 10_000
 }
 
 /// How much data a time window would keep. Drives the live preview in the window.
@@ -551,6 +561,105 @@ pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
     })
 }
 
+// ---------------------------------------------------------------- columns
+
+/// A column of the long table. The user picks which of these are written and
+/// in what order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    /// The readable instant, `18.09.2026 06:03:48.7883740`.
+    Time,
+    /// The untouched FILETIME number the database stores.
+    TimeRaw,
+    /// The tag number the value belongs to.
+    Id,
+    /// The logged value.
+    Value,
+    /// The name of the tag.
+    Name,
+    /// 192 means good; anything else is doubtful.
+    Quality,
+}
+
+impl Column {
+    /// Every column there is, in the order they are written by default.
+    pub const ALL: [Self; 6] = [
+        Self::Time,
+        Self::TimeRaw,
+        Self::Id,
+        Self::Value,
+        Self::Name,
+        Self::Quality,
+    ];
+
+    /// The heading written into the CSV.
+    pub fn header(self) -> &'static str {
+        match self {
+            Self::Time => "pk_TimeStamp",
+            Self::TimeRaw => "pk_TimeStamp_Raw",
+            Self::Id => "pk_fk_Id",
+            Self::Value => "Value",
+            Self::Name => "Name",
+            Self::Quality => "Quality",
+        }
+    }
+
+    /// What it holds, in words, for the chooser.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Time => "the time, as 18.09.2026 06:03:48.7883740",
+            Self::TimeRaw => "the untouched number from the database",
+            Self::Id => "tag number",
+            Self::Value => "the logged value",
+            Self::Name => "tag name",
+            Self::Quality => "192 is good, anything else doubtful",
+        }
+    }
+
+    /// The short spelling accepted on the command line.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::TimeRaw => "raw",
+            Self::Id => "id",
+            Self::Value => "value",
+            Self::Name => "name",
+            Self::Quality => "quality",
+        }
+    }
+
+    /// Read back a [`Column::key`], or a full heading.
+    pub fn parse(text: &str) -> Option<Self> {
+        let t = text.trim().to_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|c| c.key() == t || c.header().to_lowercase() == t)
+    }
+}
+
+/// A column of the long table as it will be written: where the data comes
+/// from, and the heading the user put on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutColumn {
+    pub source: Column,
+    pub header: String,
+}
+
+impl OutColumn {
+    /// A column under its original heading.
+    pub fn new(source: Column) -> Self {
+        Self {
+            source,
+            header: source.header().to_string(),
+        }
+    }
+
+    /// Every column, in the order they are written by default.
+    pub fn all() -> Vec<Self> {
+        Column::ALL.into_iter().map(Self::new).collect()
+    }
+}
+
 // ---------------------------------------------------------------- job
 
 pub struct Job {
@@ -565,6 +674,8 @@ pub struct Job {
     pub range: Range,
     /// Shorten tag names to the part that tells them apart.
     pub shorten_names: bool,
+    /// The columns of the long table, in the order they are written.
+    pub columns: Vec<OutColumn>,
 }
 
 #[derive(Debug)]
@@ -693,6 +804,9 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     let long_path = job.out_dir.join(format!("{}_long.csv", job.base_name));
     let wide_path = job.out_dir.join(format!("{}_wide.csv", job.base_name));
 
+    if job.write_long && job.columns.is_empty() {
+        return Err("the long table needs at least one column".into());
+    }
     let mut long = if job.write_long {
         let f = fs::File::create(&long_path)
             .map_err(|e| format!("cannot write {}: {e}", long_path.display()))?;
@@ -711,19 +825,11 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     let mut line = String::with_capacity(256);
     if let Some(w) = long.as_mut() {
         line.clear();
-        let headers = [
-            "pk_TimeStamp",
-            "pk_TimeStamp_Raw",
-            "pk_fk_Id",
-            "Value",
-            "Name",
-            "Quality",
-        ];
-        for (i, h) in headers.iter().enumerate() {
+        for (i, c) in job.columns.iter().enumerate() {
             if i > 0 {
                 line.push(delim);
             }
-            field(&mut line, h, delim);
+            field(&mut line, &c.header, delim);
         }
         line.push('\n');
         w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
@@ -802,17 +908,21 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
 
         if let Some(w) = long.as_mut() {
             line.clear();
-            field(&mut line, &iso, delim);
-            line.push(delim);
-            field(&mut line, &ts.to_string(), delim);
-            line.push(delim);
-            field(&mut line, &id.to_string(), delim);
-            line.push(delim);
-            field(&mut line, &value, delim);
-            line.push(delim);
-            field(&mut line, &header_name(id), delim);
-            line.push(delim);
-            field(&mut line, &quality.to_string(), delim);
+            for (i, c) in job.columns.iter().enumerate() {
+                if i > 0 {
+                    line.push(delim);
+                }
+                // Only the chosen columns are built, so leaving one out saves
+                // the work of producing it as well as the space.
+                match c.source {
+                    Column::Time => field(&mut line, &iso, delim),
+                    Column::TimeRaw => field(&mut line, &ts.to_string(), delim),
+                    Column::Id => field(&mut line, &id.to_string(), delim),
+                    Column::Value => field(&mut line, &value, delim),
+                    Column::Name => field(&mut line, &header_name(id), delim),
+                    Column::Quality => field(&mut line, &quality.to_string(), delim),
+                }
+            }
             line.push('\n');
             w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         }
@@ -1019,6 +1129,37 @@ mod tests {
         assert_eq!(
             shorten_tag_names(&one)[&1],
             "Anlage1::Zustand_Druck:Archivvariable_1"
+        );
+    }
+
+    #[test]
+    fn columns_are_named_both_ways() {
+        // Every column is reachable by its short key and by its heading.
+        for c in Column::ALL {
+            assert_eq!(Column::parse(c.key()), Some(c), "key of {c:?}");
+            assert_eq!(Column::parse(c.header()), Some(c), "header of {c:?}");
+            assert_eq!(
+                Column::parse(&c.header().to_uppercase()),
+                Some(c),
+                "case of {c:?}"
+            );
+        }
+        assert_eq!(Column::parse("pk_fk_id"), Some(Column::Id));
+        assert_eq!(Column::parse("  value  "), Some(Column::Value));
+        assert_eq!(Column::parse("nonsense"), None);
+
+        // The headings are what the CSV has always used.
+        let all: Vec<&str> = Column::ALL.iter().map(|c| c.header()).collect();
+        assert_eq!(
+            all,
+            [
+                "pk_TimeStamp",
+                "pk_TimeStamp_Raw",
+                "pk_fk_Id",
+                "Value",
+                "Name",
+                "Quality"
+            ]
         );
     }
 

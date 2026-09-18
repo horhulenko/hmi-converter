@@ -49,8 +49,20 @@ want for filtering and grouping:
 | `Name` | tag name, `LoggingTag.Name` |
 | `Quality` | `192` means good; anything else is doubtful |
 
-**`<name>_wide.csv`** — one row per timestamp, one column per tag, for plotting
+**`<name>_wide.csv`** - one row per timestamp, one column per tag, for plotting
 and for Excel. An empty cell means that tag logged nothing at that instant.
+
+### Choosing the long table's columns
+
+The **Columns...** button beside *Long table* opens a chooser where you can
+
+* untick any column you do not want,
+* drag a row by its handle into any order (the others slide out of the way),
+* type your own heading for any column - leave it empty to keep the original.
+
+The first line of the file is shown as you edit, and a warning appears if two
+columns would end up with the same heading. Whatever you set is kept: reopening
+the chooser, or the program itself, brings it all back.
 
 ### What is included
 
@@ -111,6 +123,53 @@ VentilP1Endlage1_I                      would otherwise collapse to just "I"
 
 The window shows a real example from your own file as soon as you tick the box.
 
+## Charts
+
+**Open charts** builds one HTML page beside the CSV files and hands it to your
+browser. Everything is inside that page: the Apache ECharts library is compiled
+into the program and copied in, so the chart works with no network, no install
+and no server - and the file can be sent to someone else as it is.
+
+Eleven ways to look at the same values, switched with one click:
+
+| | |
+| --- | --- |
+| Lines, Area, Stacked, Steps, Scatter, Bars | the value against time |
+| Small multiples | one little chart per tag, to skim a hundred tags at once |
+| Heatmap | time across, tags down, colour for the value |
+| Histogram | how often each value occurs |
+| Box plot | median, quartiles and reach, tag beside tag |
+| Correlation | one tag against another, coloured by time |
+
+Hovering anywhere on a time chart lists **every chosen tag with its name and its
+value at that instant**, largest first. Tags do not log in step with each other,
+so a reading that still stands is marked `held` rather than invented.
+
+The list on the left switches tags in and out as you watch, with a filter box
+and All / None / Invert. **Log scale** covers values spanning orders of
+magnitude; **Normalise** puts everything on 0-100% when the units differ.
+Drag on the chart to zoom, or use the slider underneath.
+
+Only the eight busiest tags are on at the start, so the first view is readable.
+
+### Detail
+
+The whole log is more points than a browser enjoys, so **Chart detail** decides
+how many of them go into the page:
+
+| | |
+| --- | --- |
+| Light | up to 1000 points per tag |
+| Balanced (default) | up to 4000 points per tag |
+| Full | every point, largest file |
+
+Thinning uses *largest-triangle-three-buckets*, which keeps the shape of the
+line and its peaks rather than averaging them away. The sample export at
+Balanced is 83 000 of 602 922 points and makes a 3.4 MB page.
+
+Tags that log text rather than numbers cannot go on an axis; they are left out
+and counted on the finished screen.
+
 ## Command line
 
 Passing file names converts without opening a window:
@@ -127,8 +186,11 @@ hmi-converter data/*.db3 --from "18.09.2026 07:00" --until "18.09.2026 07:30"
 | `--from WHEN` | ignore entries before this date/time |
 | `--until WHEN` | ignore entries after this date/time |
 | `--short-names` | shorten tag names to the telling part |
+| `--columns LIST` | long-table columns, in order: `time,raw,id,value,name,quality`; add `=HEADING` to rename one, e.g. `--columns "time=Zeit,name=Messstelle,value=Wert"` |
 | `--semicolon` | use `;` instead of `,` (Excel with a comma decimal mark) |
 | `--long-only`, `--wide-only` | write just one of the two tables |
+| `--chart` | also write the interactive chart page |
+| `--detail LEVEL` | chart detail: `full`, `balanced` or `light` |
 | `--gui` | open the window with these files already loaded |
 
 `--gui` is what makes dragging the two databases onto the `.exe` useful: put a
@@ -140,5 +202,13 @@ shortcut with that flag wherever it is handy.
 cargo test
 ```
 
-covers the FILETIME conversion in both directions, the date parser, the tag-name
-shortening (including the cases that must not merge) and CSV quoting.
+covers the FILETIME conversion in both directions, the date parser, the chart
+clock and its point-thinning, the column
+names, the tag-name shortening (including the cases that must not merge) and
+CSV quoting.
+
+## Credits
+
+Charts are drawn by Apache ECharts (Apache-2.0), a copy of which lives in
+`assets/echarts.min.js` and is compiled into the program, so the pages it
+writes never need the network.
