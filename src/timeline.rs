@@ -73,12 +73,19 @@ pub fn ui(
     );
     let paint = ui.painter().with_clip_rect(rect.expand(2.0));
 
-    // Nothing loaded yet: an empty track, so the card does not jump about
-    // when the first file arrives.
+    // Nothing loaded yet: one empty box the size of the whole picture, so the
+    // card is the same height before and after the first file arrives.
     let Some((t0, t1)) = bounds.filter(|(a, b)| b > a) else {
-        paint.rect_filled(track(rect), egui::CornerRadius::same(4), theme::FIELD);
+        let empty = rect.shrink2(egui::vec2(0.0, 2.0));
+        paint.rect(
+            empty,
+            egui::CornerRadius::same(4),
+            theme::FIELD.gamma_multiply(0.5),
+            egui::Stroke::new(1.0, EDGE),
+            egui::StrokeKind::Inside,
+        );
         paint.text(
-            rect.center(),
+            empty.center(),
             egui::Align2::CENTER_CENTER,
             "the log appears here once a file is loaded",
             egui::FontId::proportional(12.0),
@@ -351,14 +358,6 @@ pub fn ui(
     }
 
     changed
-}
-
-/// The strip the bars and windows live in.
-fn track(rect: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.top() + AXIS_H),
-        egui::pos2(rect.right(), rect.bottom() - 6.0),
-    )
 }
 
 /// What the pointer would take hold of: an edge (true) or the middle (false).

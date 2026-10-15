@@ -22,6 +22,19 @@ cargo build --release
 The program is `target/release/hmi-converter.exe`. It needs no installation and
 no runtime.
 
+The release profile is already built for size — optimised for space rather than
+speed, link-time optimisation across crates, one code unit, no unwind tables and
+no symbols. To go further, pack the finished file:
+
+```bash
+upx --best --lzma target/release/hmi-converter.exe
+```
+
+11.4 MB becomes 4.3 MB. It is the same program: it unpacks itself into memory
+when it starts, which costs a fraction of a second once. Some antivirus
+scanners look twice at packed executables, so ship the plain one where that
+matters.
+
 ## Using the window
 
 1. Drag the `.db3` files onto the window, or their whole folder (or press
