@@ -1,14 +1,16 @@
 # HMI Log Converter
 
-Turns a pair of WinCC HMI logging databases into one flat CSV table.
+Turns WinCC HMI logging databases into one flat CSV table.
 
 ```
 Tags.db3     LoggingTag           tag numbers and their names
 Values.db3   LoggedProcessValue   the logged values
 ```
 
-Drop both files on the window in **any order, with any file name** — the program
-looks inside each file and works out which is which by its tables. The source
+An HMI starts a new value database every so often, so a week of history is a
+row of files rather than one. Drop **as many as you like, in any order, with
+any file name** — or the whole folder, which is searched for databases. Every
+file is opened to see what it holds, so the names do not matter. The source
 databases are only ever read, never changed.
 
 ## Build
@@ -22,16 +24,57 @@ no runtime.
 
 ## Using the window
 
-1. Drag both `.db3` files onto the window (or press **Choose files…**).
-   Dropping the whole folder works too. Each loaded file can be clicked to show
-   it in Explorer.
-2. Optionally narrow the **time range**. While you type it shows how many values
-   would be left.
-3. Check the name under **Save to** and what to write under **What to write**.
-4. Press **Convert to CSV**.
+1. Drag the `.db3` files onto the window, or their whole folder (or press
+   **Choose files…** / **Choose a folder…**).
+2. Look over **Files to import** and untick anything you do not want.
+3. Optionally take a slice out of the log under **Time range**.
+4. Check the name under **Save to** and what to write under **What to write**.
+5. Press **Convert to CSV**.
 
-The last time range you converted is remembered: it appears as the grey
-placeholder in the field, and the **Use last** button fills it in again.
+### Files to import
+
+One row per database found, in the order they are read:
+
+| column | |
+| --- | --- |
+| tick | whether the file takes part in this import |
+| Holds | `tag names`, `values`, or both |
+| File | its name; click it to show the file in Explorer |
+| Values | how many of its values the import will write |
+| Logged from | when it starts, and how long it covers |
+| Size | the file on disk |
+
+Including and excluding is meant to be quick:
+
+* a **tick**, or a click anywhere on the row
+* **shift**-click to carry that on to every row back to the last one ticked
+* **right-click** for that file and no other
+* **All**, **None**, **Invert**, and a filter box once the list is long
+* the **✕** at the end of a row takes the file off the list altogether
+
+Underneath, the totals say what the import adds up to. They also warn when no
+tag database is in (tags are then written as `id_<number>`) and when two files
+cover the same period, which would write those readings twice.
+
+### Time range
+
+The files are drawn on one axis, each as a bar where it logs — **bright where
+it really logged, faint where it did not**, so a night the plant stood still is
+visible before converting rather than after.
+
+* **drag across the bar** to take a slice
+* **drag its edges** to adjust it, or the middle to move it; the edges snap to
+  the ends of the files
+* **Split** cuts a slice in two so the halves can be pulled apart, which leaves
+  the quiet hour between them out of the export. Any number of slices is
+  allowed, and **Whole log** forgets them again.
+* the **From** and **Until** fields say exactly where the chosen slice falls,
+  and can be typed into instead
+
+While you drag, the count of what survives follows along, file by file.
+
+The last range you converted is remembered: it appears as the grey placeholder
+in the fields, and the **Use last** button fills it in again.
 
 ## Output
 
@@ -48,6 +91,7 @@ want for filtering and grouping:
 | `Value` | the logged value |
 | `Name` | tag name, `LoggingTag.Name` |
 | `Quality` | `192` means good; anything else is doubtful |
+| `SourceFile` | which database the row came from — off unless you tick it |
 
 **`<name>_wide.csv`** - one row per timestamp, one column per tag, for plotting
 and for Excel. An empty cell means that tag logged nothing at that instant.
@@ -71,6 +115,12 @@ All three value tables are merged: `LoggedProcessValue` (numbers),
 Rows are joined on `LoggedProcessValue.pk_fk_Id = LoggingTag.pk_Key`; a tag with
 no name is written as `id_<number>`.
 
+So are the files. Each database is read on its own thread and the rows are
+merged by time as they arrive, so one export of ten files is one table in one
+time order — not ten tables after one another. The finished screen says how
+many values came out of each file, and the `SourceFile` column can put that
+into the table itself.
+
 Nothing is silently dropped. Rows of doubtful quality are kept and marked in the
 `Quality` column, and the summary screen says how many there were.
 
@@ -83,10 +133,11 @@ The database itself stores Windows FILETIME — 100-nanosecond ticks since
 1601-01-01. Both the readable time and the original number are written, so
 nothing is lost.
 
-## Time range
+## Time range, in writing
 
-Anything before **From** or after **Until** is ignored. Both ends are inclusive
-and either may be left empty. Accepted spellings:
+Anything outside the slices is ignored. Both ends of a slice are inclusive and
+either may be left empty, which means "no limit at this end". Accepted
+spellings:
 
 ```
 18.09.2026                 a whole day
@@ -172,12 +223,16 @@ and counted on the finished screen.
 
 ## Command line
 
-Passing file names converts without opening a window:
+Passing file or folder names converts without opening a window:
 
 ```bash
 hmi-converter Tags.db3 Values.db3 -o output_folder
+hmi-converter D:\HMI\export -o out            # the whole folder, however many files
 hmi-converter data/*.db3 --from "18.09.2026 07:00" --until "18.09.2026 07:30"
 ```
+
+It prints what it found and what each file contributed. The window is the place
+for several slices of time; the command line takes the one `--from`/`--until`.
 
 | option | meaning |
 | --- | --- |
@@ -186,15 +241,15 @@ hmi-converter data/*.db3 --from "18.09.2026 07:00" --until "18.09.2026 07:30"
 | `--from WHEN` | ignore entries before this date/time |
 | `--until WHEN` | ignore entries after this date/time |
 | `--short-names` | shorten tag names to the telling part |
-| `--columns LIST` | long-table columns, in order: `time,raw,id,value,name,quality`; add `=HEADING` to rename one, e.g. `--columns "time=Zeit,name=Messstelle,value=Wert"` |
+| `--columns LIST` | long-table columns, in order: `time,raw,id,value,name,quality,file`; add `=HEADING` to rename one, e.g. `--columns "time=Zeit,name=Messstelle,value=Wert"` |
 | `--semicolon` | use `;` instead of `,` (Excel with a comma decimal mark) |
 | `--long-only`, `--wide-only` | write just one of the two tables |
 | `--chart` | also write the interactive chart page |
 | `--detail LEVEL` | chart detail: `full`, `balanced` or `light` |
 | `--gui` | open the window with these files already loaded |
 
-`--gui` is what makes dragging the two databases onto the `.exe` useful: put a
-shortcut with that flag wherever it is handy.
+`--gui` is what makes dropping databases, or their folder, onto the `.exe`
+useful: put a shortcut with that flag wherever it is handy.
 
 ## Tests
 
@@ -203,9 +258,9 @@ cargo test
 ```
 
 covers the FILETIME conversion in both directions, the date parser, the chart
-clock and its point-thinning, the column
-names, the tag-name shortening (including the cases that must not merge) and
-CSV quoting.
+clock and its point-thinning, the column names, the SQL that several time
+slices turn into, the tag-name shortening (including the cases that must not
+merge) and CSV quoting.
 
 ## Credits
 
