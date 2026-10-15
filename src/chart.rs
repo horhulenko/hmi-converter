@@ -5,6 +5,7 @@
 //! library is baked into the program and copied into the page, so the chart
 //! opens with no network and no installed anything.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,8 +65,8 @@ impl Detail {
 }
 
 pub struct ChartJob {
-    pub tags_db: PathBuf,
-    pub values_db: PathBuf,
+    pub tag_dbs: Vec<PathBuf>,
+    pub value_dbs: Vec<PathBuf>,
     pub out_dir: PathBuf,
     pub base_name: String,
     pub range: Range,
@@ -179,10 +180,13 @@ pub fn load(
         let _ = tx.send(Progress::Stage(s.to_string()));
     };
 
+    if job.value_dbs.is_empty() {
+        return Err("no database with logged values was chosen".into());
+    }
+
     // -- names -------------------------------------------------------------
     say("Reading tag names");
-    let tags = convert::open_readonly(&job.tags_db)?;
-    let listed = convert::read_tag_names(&tags)?;
+    let listed = convert::read_all_tag_names(&job.tag_dbs)?;
     let names = if job.shorten_names {
         convert::shorten_tag_names(&listed)
     } else {
@@ -190,108 +194,133 @@ pub fn load(
     };
 
     // -- values ------------------------------------------------------------
-    say("Reading values");
-    let vals = convert::open_readonly(&job.values_db)?;
-    let present = convert::table_names(&vals)?;
+    // One file at a time, each tag collecting its own points. Several files are
+    // one log cut into pieces, so the points of a tag are put back together
+    // and sorted once at the end.
     let where_sql = convert::range_where(job.range);
+    let mut text_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut points: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
+    let mut order: Vec<i64> = Vec::new();
+    let mut total: u64 = 0;
+    let mut read: u64 = 0;
+    let (mut first_ms, mut last_ms) = (i64::MAX, i64::MIN);
 
-    // Text readings have no place on an axis; they are counted and left out.
-    let mut skipped_text = 0usize;
-    if present.contains("LoggedProcessValueText") {
-        skipped_text = vals
-            .query_row(
-                &format!(
-                    "SELECT COUNT(DISTINCT pk_fk_Id) FROM \"LoggedProcessValueText\"{where_sql}"
-                ),
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as usize;
+    // What there is to read, so the progress bar means something.
+    let mut plan: Vec<(PathBuf, Vec<&'static str>)> = Vec::new();
+    for db in &job.value_dbs {
+        let conn = convert::open_readonly(db)?;
+        let present = convert::table_names(&conn)?;
+
+        // Text readings have no place on an axis; they are counted and left out.
+        if present.contains("LoggedProcessValueText") {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT DISTINCT pk_fk_Id FROM \"LoggedProcessValueText\"{where_sql}"
+                ))
+                .map_err(|e| e.to_string())?;
+            let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+            while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+                text_ids.insert(r.get(0).map_err(|e| e.to_string())?);
+            }
+        }
+
+        let numeric: Vec<&'static str> = ["LoggedProcessValue", "LoggedProcessValue64"]
+            .into_iter()
+            .filter(|t| present.contains(*t))
+            .collect();
+        for t in &numeric {
+            total += conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM \"{t}\"{where_sql}"),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n as u64)
+                .unwrap_or(0);
+        }
+        plan.push((db.clone(), numeric));
     }
-
-    let numeric: Vec<&str> = ["LoggedProcessValue", "LoggedProcessValue64"]
-        .into_iter()
-        .filter(|t| present.contains(*t))
-        .collect();
-    if numeric.is_empty() {
-        return Err("this database holds no numeric values to plot".into());
+    if plan.iter().all(|(_, n)| n.is_empty()) {
+        return Err("the chosen databases hold no numeric values to plot".into());
     }
-
-    let total: u64 = numeric
-        .iter()
-        .map(|t| {
-            vals.query_row(
-                &format!("SELECT COUNT(*) FROM \"{t}\"{where_sql}"),
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n as u64)
-            .unwrap_or(0)
-        })
-        .sum();
     if total == 0 {
         return Err("no values to plot in the chosen time range".into());
     }
 
-    // Grouped by tag, so each series arrives in one run and in time order.
-    let sql = numeric
-        .iter()
-        .map(|t| format!("SELECT pk_fk_Id, pk_TimeStamp, Value FROM \"{t}\"{where_sql}"))
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
-        + " ORDER BY pk_fk_Id, pk_TimeStamp";
-    let mut stmt = vals.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-
-    let mut series: Vec<Series> = Vec::new();
-    let mut current: Option<i64> = None;
-    let mut read: u64 = 0;
-    let (mut first_ms, mut last_ms) = (i64::MAX, i64::MIN);
-
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let ticks: i64 = row.get(1).map_err(|e| e.to_string())?;
-        let value: f64 = match row.get_ref(2).map_err(|e| e.to_string())? {
-            rusqlite::types::ValueRef::Real(f) => f,
-            rusqlite::types::ValueRef::Integer(i) => i as f64,
-            _ => continue,
-        };
-        if !value.is_finite() {
+    for (db, numeric) in &plan {
+        if numeric.is_empty() {
             continue;
         }
+        say(&format!("Reading {}", convert::short_name(db)));
+        let conn = convert::open_readonly(db)?;
+        // Grouped by tag, so each tag's points arrive in one run and in order.
+        let sql = numeric
+            .iter()
+            .map(|t| format!("SELECT pk_fk_Id, pk_TimeStamp, Value FROM \"{t}\"{where_sql}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+            + " ORDER BY pk_fk_Id, pk_TimeStamp";
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
 
-        if current != Some(id) {
-            current = Some(id);
-            series.push(Series {
-                name: names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("id_{id}")),
-                points: Vec::new(),
-            });
-        }
-        let ms = ticks_to_ms(ticks);
-        first_ms = first_ms.min(ms);
-        last_ms = last_ms.max(ms);
-        series
-            .last_mut()
-            .expect("a series was just pushed")
-            .points
-            .push((ms, value));
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let ticks: i64 = row.get(1).map_err(|e| e.to_string())?;
+            let value: f64 = match row.get_ref(2).map_err(|e| e.to_string())? {
+                rusqlite::types::ValueRef::Real(f) => f,
+                rusqlite::types::ValueRef::Integer(i) => i as f64,
+                _ => continue,
+            };
+            if !value.is_finite() {
+                continue;
+            }
 
-        read += 1;
-        if read.is_multiple_of(8192) {
-            let _ = tx.send(Progress::Rows { done: read, total });
+            let ms = ticks_to_ms(ticks);
+            first_ms = first_ms.min(ms);
+            last_ms = last_ms.max(ms);
+            points
+                .entry(id)
+                .or_insert_with(|| {
+                    order.push(id);
+                    Vec::new()
+                })
+                .push((ms, value));
+
+            read += 1;
+            if read.is_multiple_of(8192) {
+                let _ = tx.send(Progress::Rows { done: read, total });
+            }
         }
     }
     let _ = tx.send(Progress::Rows { done: read, total });
 
-    if series.is_empty() {
+    if points.is_empty() {
         return Err("no numeric values to plot".into());
     }
+
+    // Tag numbers, so the series are in the same order whatever the files.
+    order.sort_unstable();
+    let several = plan.len() > 1;
+    let mut series: Vec<Series> = Vec::with_capacity(order.len());
+    for id in order {
+        let mut tag_points = points.remove(&id).unwrap_or_default();
+        // Pieces of one log overlap only at their seams, so this sort is
+        // nearly free, and it costs nothing at all for a single file.
+        if several {
+            tag_points.sort_by_key(|(ms, _)| *ms);
+        }
+        series.push(Series {
+            name: names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("id_{id}")),
+            points: tag_points,
+        });
+    }
+    let skipped_text = text_ids.len();
 
     // -- thin it out -------------------------------------------------------
     say("Preparing the chart");
@@ -352,10 +381,10 @@ pub fn build(
         drawn,
         read,
         job.detail.label(),
-        job.values_db
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        match job.value_dbs.as_slice() {
+            [one] => convert::short_name(one),
+            many => format!("{} databases", many.len()),
+        },
     );
     json_string(&mut payload, &foot);
 

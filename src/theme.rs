@@ -192,6 +192,21 @@ pub fn drop_card(hovering: bool) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(12, 14))
 }
 
+/// A small coloured tag, for what a file holds. Drawn rather than written, so
+/// it stays the same height whatever the text.
+pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let font = FontId::new(SIZE_SMALL, FontFamily::Proportional);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let pad = egui::vec2(6.0, 3.0);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(4),
+        color.gamma_multiply(0.16),
+    );
+    ui.painter().galley(rect.min + pad, galley, color);
+}
+
 /// The status mark in front of a row. Drawn, so it looks the same on every
 /// machine whatever the font happens to contain.
 pub fn dot(ui: &mut egui::Ui, color: Color32) {

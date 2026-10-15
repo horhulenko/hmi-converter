@@ -21,8 +21,9 @@ use eframe::egui;
 use plotview::PlotView;
 use theme::{ACCENT, BAD, DIM, MUTED, OK, TEXT, WARN, body, dot, lead, muted, strong};
 
-/// A counting request answered on a worker thread: which request, and its result.
-type CountReply = (u64, Result<Kept, String>);
+/// A counting request answered on a worker thread: which request, which file,
+/// and what the time range keeps of it.
+type CountReply = (u64, PathBuf, Result<Kept, String>);
 
 /// Values read for the chart drawn in this window.
 type PlotReply = Result<Loaded, String>;
@@ -273,35 +274,68 @@ fn cli(args: &[String]) -> i32 {
         }
     }
 
-    let (mut tags, mut values) = (None, None);
-    for path in &inputs {
-        match convert::probe(path) {
+    // Folders are searched, so `hmi-converter D:\log` converts a whole export.
+    let mut tag_dbs: Vec<PathBuf> = Vec::new();
+    let mut value_dbs: Vec<PathBuf> = Vec::new();
+    for path in convert::candidates(&inputs) {
+        match convert::probe(&path) {
             Ok(p) => {
                 if p.has_values {
-                    values = Some(p.path.clone());
+                    value_dbs.push(p.path.clone());
                 }
                 if p.has_tags {
-                    tags = Some(p.path.clone());
+                    tag_dbs.push(p.path.clone());
                 }
-                if !p.has_values && !p.has_tags {
-                    eprintln!("{}: nothing usable", path.display());
-                }
+                println!(
+                    "{}  {}  {}",
+                    convert::short_name(&p.path),
+                    p.role().to_lowercase(),
+                    if p.has_values {
+                        format!("{} values", sep(p.value_rows))
+                    } else {
+                        format!("{} tags", sep(p.tag_count))
+                    }
+                );
             }
             Err(e) => eprintln!("{}: {e}", path.display()),
         }
     }
-    let (Some(tags), Some(values)) = (tags, values) else {
-        eprintln!("Need one database with LoggingTag and one with LoggedProcessValue.");
+    if value_dbs.is_empty() {
+        eprintln!("Need at least one database with a LoggedProcessValue table.");
         return 2;
-    };
+    }
+    if tag_dbs.is_empty() {
+        eprintln!("No LoggingTag table found -- tags will be written as id_<number>.");
+    }
+    // The values are read oldest first, so the tables come out in time order.
+    value_dbs.sort_by_key(|p| {
+        convert::probe(p)
+            .ok()
+            .and_then(|x| x.span.map(|s| s.0))
+            .unwrap_or(i64::MAX)
+    });
 
     let job = Job {
         out_dir: out_dir
-            .or_else(|| values.parent().map(|p| p.to_path_buf()))
+            .or_else(|| value_dbs[0].parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from(".")),
-        base_name: base_name.unwrap_or_else(|| stem_of(&values)),
-        tags_db: tags,
-        values_db: values,
+        base_name: base_name.unwrap_or_else(|| match value_dbs.as_slice() {
+            [one] => stem_of(one),
+            many => {
+                let stems: Vec<String> = many.iter().map(|p| stem_of(p)).collect();
+                let shared = common_prefix(&stems);
+                let cut = shared
+                    .trim_end_matches(|c: char| !"_-.".contains(c))
+                    .trim_end_matches(['_', '-', '.']);
+                if cut.len() >= 3 {
+                    cut.to_string()
+                } else {
+                    stem_of(&value_dbs[0])
+                }
+            }
+        }),
+        tag_dbs: tag_dbs.clone(),
+        value_dbs: value_dbs.clone(),
         semicolon,
         write_long,
         write_wide,
@@ -332,6 +366,15 @@ fn cli(args: &[String]) -> i32 {
 
     match result {
         Ok(s) => {
+            if s.sources.len() > 1 {
+                for (path, rows) in &s.sources {
+                    println!(
+                        "  {} values from {}",
+                        sep(*rows),
+                        convert::short_name(path)
+                    );
+                }
+            }
             for (path, rows) in &s.files {
                 println!("{}  ({} rows)", path.display(), sep(*rows));
             }
@@ -354,8 +397,8 @@ fn cli(args: &[String]) -> i32 {
 
     // The chart page, from the same files and the same time range.
     let chart_job = ChartJob {
-        tags_db: job.tags_db.clone(),
-        values_db: job.values_db.clone(),
+        tag_dbs: job.tag_dbs.clone(),
+        value_dbs: job.value_dbs.clone(),
         out_dir: job.out_dir.clone(),
         base_name: job.base_name.clone(),
         range: job.range,
@@ -411,18 +454,77 @@ enum State {
     Failed(String),
 }
 
-/// What the live "how much would be kept" preview currently shows.
-enum Preview {
-    /// Nothing typed, or no value database yet.
-    Idle,
+/// What the live "how much would be kept" preview currently shows for one file.
+#[derive(Clone)]
+enum Count {
+    /// No time range is set, so the whole file is taken.
+    Whole,
     Counting,
     Kept(Kept),
     Bad(String),
 }
 
+/// One database the program found, and whether it takes part in the import.
+#[derive(Clone)]
+struct Source {
+    probe: Probe,
+    /// The checkbox in the preview table.
+    on: bool,
+    kept: Count,
+}
+
+impl Source {
+    fn path(&self) -> &Path {
+        &self.probe.path
+    }
+
+    /// How many values this file contributes, as far as it is known.
+    fn values(&self) -> Option<u64> {
+        if !self.probe.has_values {
+            return None;
+        }
+        match &self.kept {
+            Count::Whole => Some(self.probe.value_rows),
+            Count::Kept(k) => Some(k.rows),
+            _ => None,
+        }
+    }
+
+    /// The period this file covers after the time range has been applied.
+    fn span(&self) -> Option<(i64, i64)> {
+        match &self.kept {
+            Count::Kept(k) => k.span,
+            _ => self.probe.span,
+        }
+    }
+}
+
+/// What the program is doing with the files it was just handed.
+struct Scan {
+    rx: Receiver<ScanMsg>,
+    /// Files looked at so far, and how many there are in all.
+    looked: usize,
+    total: usize,
+}
+
+/// One step of looking through what was dropped, from the worker thread.
+enum ScanMsg {
+    /// How many files are going to be looked at.
+    Total(usize),
+    Found(Box<Probe>),
+    Skipped(PathBuf, String),
+    Done,
+}
+
 struct App {
-    tags: Option<Probe>,
-    values: Option<Probe>,
+    /// Every database found, in the order they are imported.
+    sources: Vec<Source>,
+    /// Looking through a dropped folder, while it lasts.
+    scan: Option<Scan>,
+    /// The row last ticked, so shift-click can fill in the ones between.
+    anchor: Option<usize>,
+    /// Narrows the table when there are many files.
+    filter: String,
     /// Feedback about the files that were just handed over.
     notes: Vec<(String, egui::Color32)>,
     state: State,
@@ -452,23 +554,28 @@ struct App {
     until_text: String,
     /// The range used the last time something was converted.
     last: Settings,
-    preview: Preview,
-    /// What the preview was computed for, so it is only recomputed when it changes.
-    preview_key: Option<(String, String, PathBuf)>,
+    /// What the per-file counts were computed for, so they are only recomputed
+    /// when the range or the chosen files change.
+    preview_key: Option<PreviewKey>,
     /// A change waiting for the typing to settle before it is counted.
-    pending: Option<(String, String, PathBuf)>,
+    pending: Option<PreviewKey>,
     pending_since: std::time::Instant,
     counter: (Sender<CountReply>, Receiver<CountReply>),
     counter_gen: u64,
 }
+
+/// The range and the files a set of counts belongs to.
+type PreviewKey = (String, String, Vec<PathBuf>);
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, preload: Vec<PathBuf>) -> Self {
         theme::apply(&cc.egui_ctx);
         let last = Settings::load();
         let mut app = Self {
-            tags: None,
-            values: None,
+            sources: Vec::new(),
+            scan: None,
+            anchor: None,
+            filter: String::new(),
             notes: Vec::new(),
             state: State::Setup,
             out_dir: None,
@@ -486,7 +593,6 @@ impl App {
             from_text: String::new(),
             until_text: String::new(),
             last,
-            preview: Preview::Idle,
             preview_key: None,
             pending: None,
             pending_since: std::time::Instant::now(),
@@ -519,27 +625,131 @@ impl App {
         Ok(Range { from, until })
     }
 
+    // -- the files that take part ------------------------------------------
+
+    /// Every included file that holds logged values, in the order they are read.
+    fn value_dbs(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .filter(|s| s.on && s.probe.has_values)
+            .map(|s| s.path().to_path_buf())
+            .collect()
+    }
+
+    /// Every included file that holds tag names.
+    fn tag_dbs(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .filter(|s| s.on && s.probe.has_tags)
+            .map(|s| s.path().to_path_buf())
+            .collect()
+    }
+
+    fn included(&self) -> impl Iterator<Item = &Source> {
+        self.sources.iter().filter(|s| s.on)
+    }
+
+    /// How many values the import would write, when every file has been counted.
+    fn total_values(&self) -> Option<u64> {
+        self.included()
+            .filter(|s| s.probe.has_values)
+            .map(Source::values)
+            .sum()
+    }
+
+    /// The period the included files cover together.
+    fn total_span(&self) -> Option<(i64, i64)> {
+        self.included()
+            .filter(|s| s.probe.has_values)
+            .filter_map(Source::span)
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+    }
+
+    /// How many tags the included tag databases describe between them.
+    fn total_tags(&self) -> usize {
+        let mut ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for s in self.included().filter(|s| s.probe.has_tags) {
+            ids.extend(s.probe.tag_names.iter().map(|(id, _)| *id));
+        }
+        ids.len()
+    }
+
+    /// Pairs of included files that log the same period. They convert, but the
+    /// same reading then appears twice, which is worth saying out loud.
+    fn overlaps(&self) -> Vec<(String, String)> {
+        let mut spans: Vec<(&str, (i64, i64))> = Vec::new();
+        for s in self.included().filter(|s| s.probe.has_values) {
+            if let Some(span) = s.probe.span {
+                spans.push((s.probe.path.to_str().unwrap_or_default(), span));
+            }
+        }
+        let mut out = Vec::new();
+        for (i, (a, (a0, a1))) in spans.iter().enumerate() {
+            for (b, (b0, b1)) in &spans[i + 1..] {
+                if a0 <= b1 && b0 <= a1 {
+                    out.push((
+                        file_name(Path::new(a)).to_string(),
+                        file_name(Path::new(b)).to_string(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// Where the files go, and what they are called.
     fn out_dir(&self) -> PathBuf {
         self.chosen_dir().unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// The folder as far as it is known: either the one picked, or the one the
-    /// value database sits in.
+    /// first included value database sits in.
     fn chosen_dir(&self) -> Option<PathBuf> {
-        self.out_dir
-            .clone()
-            .or_else(|| self.values.as_ref()?.path.parent().map(|p| p.to_path_buf()))
+        self.out_dir.clone().or_else(|| {
+            self.included()
+                .find(|s| s.probe.has_values)
+                .or_else(|| self.sources.first())?
+                .path()
+                .parent()
+                .map(|p| p.to_path_buf())
+        })
     }
 
     fn base_name(&self) -> String {
         self.base_name
             .clone()
             .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| match &self.values {
-                Some(v) => stem_of(&v.path),
-                None => "hmi".into(),
-            })
+            .unwrap_or_else(|| self.suggested_name())
+    }
+
+    /// A name for the output that says where it came from.
+    ///
+    /// One file gives its own name. Several give what their names have in
+    /// common -- an HMI numbers its files, so `..._Werte_20260302_053000` and
+    /// `..._Werte_20260303_090000` suggest `Anlage1_Werte`. Failing that,
+    /// the folder they sit in.
+    fn suggested_name(&self) -> String {
+        let stems: Vec<String> = self
+            .included()
+            .filter(|s| s.probe.has_values)
+            .map(|s| stem_of(s.path()))
+            .collect();
+        match stems.as_slice() {
+            [] => "hmi".into(),
+            [one] => one.clone(),
+            many => {
+                let shared = common_prefix(many);
+                let cut = shared.trim_end_matches(|c: char| !"_-.".contains(c));
+                let trimmed = cut.trim_end_matches(['_', '-', '.']);
+                if trimmed.len() >= 3 {
+                    return trimmed.to_string();
+                }
+                self.chosen_dir()
+                    .and_then(|d| d.file_name().map(|s| s.to_string_lossy().into_owned()))
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "hmi".into())
+            }
+        }
     }
 
     /// The columns of the long table, in the order the user put them, under the
@@ -566,50 +776,56 @@ impl App {
     }
 
     fn ready(&self) -> bool {
-        self.tags.is_some()
-            && self.values.is_some()
+        !self.value_dbs().is_empty()
             && (self.write_long || self.write_wide)
             && (!self.write_long || !self.columns().is_empty())
             && self.range().is_ok()
-            && !matches!(self.preview, Preview::Kept(ref k) if k.rows == 0)
+            && self.total_values() != Some(0)
     }
 
-    /// Recount whenever the typed range or the value database changed.
+    /// Recount whenever the typed range or the chosen files changed.
     ///
-    /// Counting touches every row, so it waits for a short pause in typing
-    /// instead of running on each keystroke.
+    /// Counting touches every row of every file, so it waits for a short pause
+    /// in typing instead of running on each keystroke -- and with no range at
+    /// all nothing needs counting, because then the whole of each file is taken.
     fn refresh_preview(&mut self, ctx: &egui::Context) {
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
-        while let Ok((seq, result)) = self.counter.1.try_recv() {
-            if seq == self.counter_gen {
-                self.preview = match result {
-                    Ok(k) => Preview::Kept(k),
-                    Err(e) => Preview::Bad(e),
+        while let Ok((seq, path, result)) = self.counter.1.try_recv() {
+            if seq != self.counter_gen {
+                continue;
+            }
+            if let Some(s) = self.sources.iter_mut().find(|s| s.path() == path) {
+                s.kept = match result {
+                    Ok(k) => Count::Kept(k),
+                    Err(e) => Count::Bad(e),
                 };
             }
         }
 
-        let Some(values) = self.values.clone() else {
-            self.preview = Preview::Idle;
-            self.preview_key = None;
-            self.pending = None;
-            return;
-        };
-        let key = (
+        let files = self.value_dbs();
+        let key: PreviewKey = (
             self.from_text.trim().to_string(),
             self.until_text.trim().to_string(),
-            values.path.clone(),
+            files.clone(),
         );
 
         // Something changed: show it at once, then let the timer run down.
         if self.preview_key.as_ref() != Some(&key) && self.pending.as_ref() != Some(&key) {
             self.pending = Some(key.clone());
             self.pending_since = std::time::Instant::now();
-            self.preview = match self.range() {
-                Ok(_) => Preview::Counting,
-                Err(e) => Preview::Bad(e),
-            };
+            let open = self.range().map(|r| r.is_open()).unwrap_or(false);
+            let bad = self.range().err();
+            for s in &mut self.sources {
+                if !s.probe.has_values {
+                    continue;
+                }
+                s.kept = match (&bad, open, s.on) {
+                    (Some(e), _, _) => Count::Bad(e.clone()),
+                    (None, true, _) | (None, _, false) => Count::Whole,
+                    _ => Count::Counting,
+                };
+            }
         }
 
         let Some(key) = self.pending.clone() else {
@@ -623,21 +839,24 @@ impl App {
         self.pending = None;
         self.preview_key = Some(key);
         let range = match self.range() {
-            Ok(r) => r,
-            Err(e) => {
-                self.preview = Preview::Bad(e);
-                return;
-            }
+            Ok(r) if !r.is_open() => r,
+            // Nothing to count: without a range every file is taken whole, and
+            // a range that does not parse is already reported.
+            _ => return,
         };
 
         self.counter_gen += 1;
         let seq = self.counter_gen;
         let tx = self.counter.0.clone();
-        let path = values.path.clone();
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send((seq, convert::count_kept(&path, range)));
-            ctx.request_repaint();
+            for path in files {
+                let kept = convert::count_kept(&path, range);
+                if tx.send((seq, path, kept)).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -645,106 +864,120 @@ impl App {
         self.notes.push((text.into(), color));
     }
 
-    /// Take whatever the user dropped or picked and sort it out.
+    /// Take whatever the user dropped or picked and look through it.
+    ///
+    /// Folders are searched, and every file inside is opened to see whether it
+    /// is an HMI database -- which can take a moment for a folder full of
+    /// hundred-megabyte files, so it happens on a worker thread and the table
+    /// fills up as the answers arrive.
     fn accept(&mut self, paths: Vec<PathBuf>) {
-        self.notes.clear();
         if matches!(self.state, State::Running { .. }) {
+            self.notes.clear();
             self.note("Busy converting -- wait until it is finished.", WARN);
             return;
         }
         self.state = State::Setup;
+        self.notes.clear();
 
-        // A dropped folder is searched for databases, so dropping the whole
-        // export directory works just as well as dropping the two files.
-        let mut files = Vec::new();
-        for p in paths {
-            if p.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&p) {
-                    for e in entries.flatten() {
-                        let path = e.path();
-                        if path.is_file() {
-                            files.push(path);
-                        }
-                    }
-                }
-            } else {
-                files.push(p);
-            }
-        }
-
-        // Journal files belong to a database, they are never opened on their own.
-        files.retain(|p| {
-            let n = p.to_string_lossy().to_lowercase();
-            !(n.ends_with("-wal") || n.ends_with("-shm") || n.ends_with("-journal"))
+        let known: Vec<PathBuf> = self.sources.iter().map(|s| s.path().to_path_buf()).collect();
+        let (tx, rx) = channel();
+        self.scan = Some(Scan {
+            rx,
+            looked: 0,
+            total: 0,
         });
+        thread::spawn(move || {
+            let files = convert::candidates(&paths);
+            let _ = tx.send(ScanMsg::Total(files.len()));
+            for path in files {
+                // Already in the table: nothing to open again.
+                if known.iter().any(|k| k == &path) {
+                    let _ = tx.send(ScanMsg::Skipped(path, "already in the list".into()));
+                    continue;
+                }
+                let msg = match convert::probe(&path) {
+                    Ok(p) => ScanMsg::Found(Box::new(p)),
+                    Err(e) => ScanMsg::Skipped(path, e),
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(ScanMsg::Done);
+        });
+    }
 
-        if files.is_empty() {
-            self.note("Nothing usable in there.", BAD);
-            return;
+    /// Collect whatever the scanning thread has found so far.
+    fn pump_scan(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &mut self.scan else { return };
+        let mut added = 0usize;
+        let mut finished = false;
+        let mut skipped: Vec<(PathBuf, String)> = Vec::new();
+        let mut found: Vec<Probe> = Vec::new();
+
+        while let Ok(msg) = scan.rx.try_recv() {
+            match msg {
+                ScanMsg::Total(n) => scan.total = n,
+                ScanMsg::Found(p) => {
+                    scan.looked += 1;
+                    found.push(*p);
+                }
+                ScanMsg::Skipped(path, why) => {
+                    scan.looked += 1;
+                    skipped.push((path, why));
+                }
+                ScanMsg::Done => finished = true,
+            }
         }
 
-        for path in files {
-            match convert::probe(&path) {
-                Ok(p) => self.assign(p),
-                Err(e) => self.note(format!("{} -- skipped: {e}", file_name(&path)), BAD),
+        for p in found {
+            added += 1;
+            self.sources.push(Source {
+                probe: p,
+                on: true,
+                kept: Count::Whole,
+            });
+        }
+        if added > 0 {
+            self.sort_sources();
+            // The counts belong to the files that were chosen before.
+            self.preview_key = None;
+        }
+        for (path, why) in skipped {
+            // One line per file would bury the useful ones; only real
+            // surprises are worth a word.
+            if why != "already in the list" {
+                self.note(format!("{} -- skipped: {why}", file_name(&path)), MUTED);
             }
+        }
+        if finished {
+            let n = self.sources.len();
+            self.scan = None;
+            if n == 0 {
+                self.note("No HMI database in there.", BAD);
+            }
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
-    /// Put a recognised database into the slot (or slots) it fits, and say what
-    /// happened -- including when it is a file that is already loaded.
-    fn assign(&mut self, p: Probe) {
-        let name = file_name(&p.path);
-        let mut loaded: Vec<&str> = Vec::new();
-        let mut again: Vec<&str> = Vec::new();
-
-        if p.has_values {
-            if self.values.as_ref().map(|v| &v.path) == Some(&p.path) {
-                again.push("logged values");
-            } else {
-                if let Some(old) = &self.values {
-                    self.note(
-                        format!("Replaced the value database {}", file_name(&old.path)),
-                        MUTED,
-                    );
-                }
-                self.values = Some(p.clone());
-                loaded.push("logged values");
-            }
-        }
-        if p.has_tags {
-            if self.tags.as_ref().map(|t| &t.path) == Some(&p.path) {
-                again.push("tag names");
-            } else {
-                if let Some(old) = &self.tags {
-                    self.note(
-                        format!("Replaced the tag database {}", file_name(&old.path)),
-                        MUTED,
-                    );
-                }
-                self.tags = Some(p.clone());
-                loaded.push("tag names");
-            }
-        }
-
-        if !loaded.is_empty() {
-            self.note(format!("{name} -- loaded as {}", loaded.join(" + ")), OK);
-        }
-        if !again.is_empty() {
-            self.note(
-                format!(
-                    "{name} is already loaded as {} -- nothing to do",
-                    again.join(" + ")
-                ),
-                WARN,
-            );
-        }
+    /// Tag databases first, then the value files in the order they were logged:
+    /// the order the import reads them, and the order they read in the table.
+    fn sort_sources(&mut self) {
+        self.sources.sort_by(|a, b| {
+            let rank = |s: &Source| u8::from(s.probe.has_values);
+            rank(a)
+                .cmp(&rank(b))
+                .then(a.probe.span.map(|s| s.0).cmp(&b.probe.span.map(|s| s.0)))
+                .then_with(|| file_name(a.path()).cmp(&file_name(b.path())))
+        });
+        self.anchor = None;
     }
 
     fn start(&mut self) {
-        let (Some(tags), Some(values)) = (&self.tags, &self.values) else {
+        if self.value_dbs().is_empty() {
             return;
-        };
+        }
         let range = match self.range() {
             Ok(r) => r,
             Err(e) => {
@@ -754,8 +987,8 @@ impl App {
         };
 
         let job = Job {
-            tags_db: tags.path.clone(),
-            values_db: values.path.clone(),
+            tag_dbs: self.tag_dbs(),
+            value_dbs: self.value_dbs(),
             out_dir: self.out_dir(),
             base_name: self.base_name(),
             semicolon: self.semicolon,
@@ -800,9 +1033,9 @@ impl App {
 
     /// What to read, for either way of charting.
     fn chart_job(&mut self) -> Option<ChartJob> {
-        let (Some(tags), Some(values)) = (&self.tags, &self.values) else {
+        if self.value_dbs().is_empty() {
             return None;
-        };
+        }
         let range = match self.range() {
             Ok(r) => r,
             Err(e) => {
@@ -811,8 +1044,8 @@ impl App {
             }
         };
         Some(ChartJob {
-            tags_db: tags.path.clone(),
-            values_db: values.path.clone(),
+            tag_dbs: self.tag_dbs(),
+            value_dbs: self.value_dbs(),
             out_dir: self.out_dir(),
             base_name: self.base_name(),
             range,
@@ -917,7 +1150,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
         if matches!(self.state, State::Setup) {
-            self.refresh_preview(ui.ctx());
+            let ctx = ui.ctx().clone();
+            self.pump_scan(&ctx);
+            self.refresh_preview(&ctx);
         }
         let ctx = ui.ctx().clone();
 
@@ -969,96 +1204,308 @@ impl eframe::App for App {
 impl App {
     // -- choosing files and options ---------------------------------------
     fn setup_view(&mut self, ui: &mut egui::Ui, hovering: bool) {
-        // Two cards per row: what comes in on the left, what goes out on the
-        // right, so the whole job fits on one screen without scrolling.
+        // What comes in on top, what goes out below, so one screen holds the
+        // whole job however many files there are.
         self.drop_zone(ui, hovering);
         ui.add_space(theme::GAP);
-        ui.columns(2, |c| {
-            self.files_view(&mut c[0]);
-            self.range_view(&mut c[1]);
-        });
+        self.sources_view(ui);
         ui.add_space(theme::GAP);
         ui.columns(2, |c| {
-            self.output_view(&mut c[0]);
+            self.range_view(&mut c[0]);
             self.options_view(&mut c[1]);
         });
+        ui.add_space(theme::GAP);
+        self.output_view(ui);
         self.notes_view(ui);
     }
 
+    /// Where files are dropped. Big and inviting while the table is empty,
+    /// one line once it has something in it.
     fn drop_zone(&mut self, ui: &mut egui::Ui, hovering: bool) {
-        // Once both databases are in, this steps out of the way.
-        let full = self.tags.is_some() && self.values.is_some();
+        let empty = self.sources.is_empty();
+        let mut picked: Option<Vec<PathBuf>> = None;
         theme::drop_card(hovering).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                if full && !hovering {
+            if empty || hovering {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(lead(if hovering {
+                        "Release to look through them"
+                    } else {
+                        "Drag the .db3 files here, or a whole folder"
+                    }));
+                    ui.label(muted(
+                        "any number, any order, any file name -- every file is \
+                         opened to see whether it is an HMI database",
+                    ));
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.label(muted("Drop other .db3 files here to replace them"));
-                        if ui.small_button("Choose files...").clicked()
-                            && let Some(files) = pick_databases()
-                        {
-                            self.accept(files);
+                        // Centred as a pair, so the two buttons read as one choice.
+                        let width = 300.0_f32.min(ui.available_width());
+                        ui.add_space((ui.available_width() - width).max(0.0) / 2.0);
+                        if ui.button("Choose files...").clicked() {
+                            picked = pick_databases();
+                        }
+                        if ui.button("Choose a folder...").clicked() {
+                            picked = pick_folder();
                         }
                     });
-                    return;
-                }
-                ui.add_space(4.0);
-                ui.label(lead(if hovering {
-                    "Release to load"
-                } else {
-                    "Drag the two .db3 files here"
+                    ui.add_space(2.0);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(muted("Drop more files or folders here to add them"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Choose a folder...").clicked() {
+                            picked = pick_folder();
+                        }
+                        if ui.small_button("Choose files...").clicked() {
+                            picked = pick_databases();
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(files) = picked {
+            self.accept(files);
+        }
+    }
+
+    // -- the preview table -------------------------------------------------
+
+    /// Every database that was found, what is inside it, and a tick to leave it
+    /// out of the import.
+    fn sources_view(&mut self, ui: &mut egui::Ui) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(theme::ROW_TOP);
+            self.table_head(ui);
+            if self.sources.is_empty() {
+                ui.add_space(theme::GAP);
+                ui.label(muted(match &self.scan {
+                    Some(_) => "Looking...",
+                    None => "Nothing loaded yet -- drop the files above.",
                 }));
-                ui.label(muted("any order, any file name"));
-                ui.add_space(8.0);
-                if ui.button("Choose files...").clicked()
-                    && let Some(files) = pick_databases()
-                {
-                    self.accept(files);
+                return;
+            }
+            ui.add_space(8.0);
+            let cols = Cols::new(ui.available_width());
+            column_titles(ui, &cols);
+            self.table_rows(ui, &cols);
+            ui.add_space(6.0);
+            self.table_foot(ui);
+        });
+    }
+
+    /// The title line: how much is being imported, and the ticking buttons.
+    fn table_head(&mut self, ui: &mut egui::Ui) {
+        let on = self.included().count();
+        let all = self.sources.len();
+        let scanning = self.scan.is_some();
+        let (looked, found) = self
+            .scan
+            .as_ref()
+            .map(|s| (s.looked, s.total))
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label(strong("Files to import"));
+            if all > 0 {
+                ui.label(muted(format!("{on} of {all} included")));
+            }
+            if scanning {
+                ui.spinner();
+                ui.label(muted(if found > 0 {
+                    format!("looking through {looked} of {found} files...")
+                } else {
+                    "looking...".into()
+                }));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if all > 0 {
+                    if ui
+                        .small_button("Remove all")
+                        .on_hover_text("Empty the list and start again")
+                        .clicked()
+                    {
+                        self.sources.clear();
+                        self.filter.clear();
+                        self.notes.clear();
+                        self.preview_key = None;
+                    }
+                    if ui
+                        .small_button("Invert")
+                        .on_hover_text("Swap what is in for what is out")
+                        .clicked()
+                    {
+                        for s in &mut self.sources {
+                            s.on = !s.on;
+                        }
+                        self.preview_key = None;
+                    }
+                    if ui.small_button("None").clicked() {
+                        self.set_all(false);
+                    }
+                    if ui.small_button("All").clicked() {
+                        self.set_all(true);
+                    }
                 }
-                ui.add_space(2.0);
+                // A filter earns its place only once the list is long.
+                if all > 8 {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("filter by name")
+                            .desired_width(130.0),
+                    );
+                }
             });
         });
     }
 
-    fn files_view(&mut self, ui: &mut egui::Ui) {
-        let tags = self.tags.clone();
-        let values = self.values.clone();
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_TOP);
-            section(ui, "Databases", "");
-            ui.add_space(theme::GAP);
-            slot_row(
-                ui,
-                "Tag names",
-                tags.as_ref(),
-                "waiting for the database that holds LoggingTag",
-                |p| format!("{} tags", sep(p.tag_count)),
-            );
-            ui.add_space(theme::GAP);
-            slot_row(
-                ui,
-                "Logged values",
-                values.as_ref(),
-                "waiting for the database that holds LoggedProcessValue",
-                |p| match p.span {
-                    Some((a, b)) => format!(
-                        "{} rows\n{}  to  {}",
-                        sep(p.value_rows),
-                        convert::filetime_to_short(a),
-                        convert::filetime_to_short(b)
-                    ),
-                    None => format!("{} rows", sep(p.value_rows)),
-                },
-            );
+    fn set_all(&mut self, on: bool) {
+        for s in &mut self.sources {
+            s.on = on;
+        }
+        self.preview_key = None;
+    }
+
+    /// One row per file, and whatever was clicked on them.
+    fn table_rows(&mut self, ui: &mut egui::Ui, cols: &Cols) {
+        let needle = self.filter.trim().to_lowercase();
+        let shown: Vec<usize> = (0..self.sources.len())
+            .filter(|&i| {
+                needle.is_empty()
+                    || file_name(self.sources[i].path())
+                        .to_lowercase()
+                        .contains(&needle)
+            })
+            .collect();
+
+        let height = (shown.len().max(1) as f32 * (ROW_H + 3.0)).min(TABLE_MAX_H);
+        let mut act: Option<RowAct> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("sources")
+            .max_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if shown.is_empty() {
+                    ui.label(muted("No file matches the filter."));
+                }
+                for (nth, &i) in shown.iter().enumerate() {
+                    if let Some(a) = source_row(ui, &mut self.sources[i], cols, i, nth % 2 == 1) {
+                        act = Some(a);
+                    }
+                }
+            });
+
+        match act {
+            Some(RowAct::Toggle(i, shift)) => {
+                let wanted = !self.sources[i].on;
+                match (shift, self.anchor) {
+                    // Shift fills in everything between the two rows, which is
+                    // how a hundred segment files are handled in two clicks.
+                    (true, Some(from)) if from < self.sources.len() => {
+                        let (lo, hi) = (from.min(i), from.max(i));
+                        for s in &mut self.sources[lo..=hi] {
+                            s.on = wanted;
+                        }
+                    }
+                    _ => {
+                        self.sources[i].on = wanted;
+                        self.anchor = Some(i);
+                    }
+                }
+                self.preview_key = None;
+            }
+            Some(RowAct::Only(i)) => {
+                for (k, s) in self.sources.iter_mut().enumerate() {
+                    s.on = k == i;
+                }
+                self.anchor = Some(i);
+                self.preview_key = None;
+            }
+            Some(RowAct::Remove(i)) => {
+                self.sources.remove(i);
+                self.anchor = None;
+                self.preview_key = None;
+            }
+            Some(RowAct::Reveal(i)) => reveal(self.sources[i].path()),
+            None => {}
+        }
+    }
+
+    /// The line under the table: what the import adds up to, and anything
+    /// about it worth a warning.
+    fn table_foot(&mut self, ui: &mut egui::Ui) {
+        let values = self.value_dbs().len();
+        let tag_dbs = self.tag_dbs().len();
+        let counting = self.included().any(|s| matches!(s.kept, Count::Counting));
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            if values == 0 {
+                ui.label(body("Nothing to import -- tick a file with logged values.").color(WARN));
+                return;
+            }
+            match self.total_values() {
+                Some(0) => {
+                    ui.label(body("The time range leaves nothing in these files.").color(BAD));
+                }
+                Some(n) => {
+                    ui.label(strong(format!("{} values", sep(n))).color(OK));
+                }
+                None => {
+                    if counting {
+                        ui.spinner();
+                    }
+                    ui.label(muted("counting..."));
+                }
+            }
+            ui.label(muted(format!(
+                "from {values} {}",
+                if values == 1 { "database" } else { "databases" }
+            )));
+            if let Some((a, b)) = self.total_span() {
+                ui.label(muted(format!(
+                    "{}  to  {}",
+                    convert::filetime_to_short(a),
+                    convert::filetime_to_short(b)
+                )));
+            }
+            if tag_dbs > 0 {
+                ui.label(muted(format!("{} tag names", sep(self.total_tags() as u64))));
+            }
         });
+
+        if values > 0 && tag_dbs == 0 {
+            ui.label(
+                body("No tag database included -- tags will be written as id_<number>.")
+                    .color(WARN),
+            );
+        }
+        let overlaps = self.overlaps();
+        if let Some((a, b)) = overlaps.first() {
+            ui.label(
+                body(format!(
+                    "{a} and {b} cover the same period{} -- those readings would \
+                     be written twice.",
+                    if overlaps.len() > 1 {
+                        format!(", and {} other pair(s) do", overlaps.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                ))
+                .color(WARN),
+            );
+        }
     }
 
     /// Cut the log down to a time slice, with a live count of what survives.
     fn range_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_TOP);
+            ui.set_min_height(theme::ROW_BOTTOM);
             section(ui, "Time range", "optional");
             ui.add_space(theme::GAP);
 
@@ -1069,47 +1516,61 @@ impl App {
             range_field(ui, "Until", &mut self.until_text, &last_until, true);
 
             ui.add_space(theme::GAP);
-            match &self.preview {
-                Preview::Idle => {
-                    ui.label(muted("Load the value database to see how much is kept."));
-                }
-                Preview::Counting => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(muted("counting..."));
-                    });
-                }
-                Preview::Bad(e) => {
-                    ui.label(body(e).color(BAD));
-                }
-                Preview::Kept(k) => {
-                    let color = if k.rows == 0 {
-                        BAD
-                    } else if k.rows == k.total_rows {
-                        TEXT
-                    } else {
-                        OK
-                    };
+            let range = self.range();
+            if let Err(e) = &range {
+                ui.label(body(e.clone()).color(BAD));
+                return;
+            }
+            if self.value_dbs().is_empty() {
+                ui.label(muted("Tick a file with logged values to see what is kept."));
+                return;
+            }
+            if range.map(|r| r.is_open()).unwrap_or(false) {
+                ui.label(muted(
+                    "Everything in the ticked files is converted. Narrow this to \
+                     cut the log down to one day or one shift.",
+                ));
+                return;
+            }
+
+            let total: u64 = self
+                .included()
+                .filter(|s| s.probe.has_values)
+                .map(|s| s.probe.value_rows)
+                .sum();
+            match self.total_values() {
+                Some(kept) => {
                     ui.label(
-                        strong(if k.rows == 0 {
+                        strong(if kept == 0 {
                             "Nothing is left in this range.".to_string()
                         } else {
-                            format!(
-                                "Keeps {} of {} values  ({} timestamps)",
-                                sep(k.rows),
-                                sep(k.total_rows),
-                                sep(k.timestamps)
-                            )
+                            format!("Keeps {} of {} values", sep(kept), sep(total))
                         })
-                        .color(color),
+                        .color(if kept == 0 { BAD } else { OK }),
                     );
-                    if let Some((a, b)) = k.span {
+                    if let Some((a, b)) = self.total_span() {
                         ui.label(muted(format!(
                             "{}  to  {}",
                             convert::filetime_to_short(a),
                             convert::filetime_to_short(b)
                         )));
                     }
+                    let empty = self
+                        .included()
+                        .filter(|s| s.probe.has_values)
+                        .filter(|s| s.values() == Some(0))
+                        .count();
+                    if empty > 0 && kept > 0 {
+                        ui.label(muted(format!(
+                            "{empty} of the ticked files have nothing in this range"
+                        )));
+                    }
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(muted("counting..."));
+                    });
                 }
             }
         });
@@ -1328,9 +1789,9 @@ impl App {
 
     /// One real tag, before and after shortening, so the option is not a guess.
     fn shorten_example(&self) -> Option<(String, String)> {
-        let tags = self.tags.as_ref()?;
-        let short = convert::shorten_tag_names(&tags.tag_names);
-        let (id, full) = tags.tag_names.first()?;
+        let tags = self.included().find(|s| s.probe.has_tags)?;
+        let short = convert::shorten_tag_names(&tags.probe.tag_names);
+        let (id, full) = tags.probe.tag_names.first()?;
         Some((full.clone(), short.get(id)?.clone()))
     }
 
@@ -1364,12 +1825,22 @@ impl App {
 
     fn convert_button(&mut self, ui: &mut egui::Ui) {
         let ready = self.ready();
-        let can_chart = self.tags.is_some() && self.values.is_some() && self.range().is_ok();
+        let can_chart = !self.value_dbs().is_empty() && self.range().is_ok();
         let width = ui.available_width();
         let chart_width = 150.0_f32.min(width * 0.22);
+        // The button says how much it is about to convert, so there is no need
+        // to read the table again before pressing it.
+        let files = self.value_dbs().len();
+        let caption = match (ready, self.total_values()) {
+            (true, Some(n)) if files > 1 => {
+                format!("Convert {} values from {files} files", sep(n))
+            }
+            (true, Some(n)) => format!("Convert {} values to CSV", sep(n)),
+            _ => "Convert to CSV".to_string(),
+        };
 
         ui.horizontal(|ui| {
-            let label = theme::on_accent("Convert to CSV", ready);
+            let label = theme::on_accent(caption, ready);
             let button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow()))
                 .min_size(egui::vec2(width - chart_width * 2.0 - 16.0, 42.0))
                 .fill(theme::button_fill(ready));
@@ -1415,16 +1886,17 @@ impl App {
         });
 
         if !ready {
-            let hint = if self.tags.is_none() && self.values.is_some() {
-                "Still missing the tag database."
-            } else if self.values.is_none() && self.tags.is_some() {
-                "Still missing the value database."
+            let hint = if self.sources.is_empty() {
+                "Step 1 -- drop the .db3 files or their folder above.    \
+                 Step 2 -- press Convert."
+            } else if self.value_dbs().is_empty() {
+                "Tick at least one file that holds logged values."
             } else if !self.write_long && !self.write_wide {
                 "Pick at least one table to write."
             } else if self.write_long && self.columns().is_empty() {
                 "The long table has no columns left -- press Columns..."
-            } else if self.tags.is_none() && self.values.is_none() {
-                "Step 1 -- drop both .db3 files above.    Step 2 -- press Convert."
+            } else if self.total_values() == Some(0) {
+                "The time range leaves nothing to convert."
             } else {
                 "Check the time range above."
             };
@@ -1777,6 +2249,324 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------- file table
+
+/// Height of one row of the file table.
+const FILE_ROW: f32 = 28.0;
+/// The table starts scrolling at this height, so the cards below it stay put
+/// whether three files were dropped or three hundred.
+const TABLE_MAX_H: f32 = 236.0;
+
+/// What a click on one row of the file table asked for.
+enum RowAct {
+    /// Tick or untick this row; with shift held, everything back to the last
+    /// row that was ticked.
+    Toggle(usize, bool),
+    /// Import this file and no other.
+    Only(usize),
+    /// Take it out of the list altogether.
+    Remove(usize),
+    Reveal(usize),
+}
+
+/// How wide each column of the file table is at the width the window happens
+/// to have. The file name takes what is left over, and in a narrow window the
+/// extra columns give way to it rather than squeezing it out.
+struct Cols {
+    tick: f32,
+    role: f32,
+    name: f32,
+    rows: f32,
+    span: f32,
+    size: f32,
+    drop: f32,
+}
+
+impl Cols {
+    const GAP: f32 = 8.0;
+
+    fn new(total: f32) -> Self {
+        let (tick, role, rows, drop) = (22.0, 88.0, 104.0, 22.0);
+        let mut span = 178.0;
+        let mut size = 58.0;
+        let left = |span: f32, size: f32| {
+            let shown = 4.0
+                + if span > 0.0 { 1.0 } else { 0.0 }
+                + if size > 0.0 { 1.0 } else { 0.0 };
+            total - (tick + role + rows + drop + span + size) - Self::GAP * shown
+        };
+        if left(span, size) < 150.0 {
+            size = 0.0;
+        }
+        if left(span, size) < 150.0 {
+            span = 0.0;
+        }
+        Self {
+            tick,
+            role,
+            name: left(span, size).max(70.0),
+            rows,
+            span,
+            size,
+            drop,
+        }
+    }
+}
+
+/// The headings above the rows.
+fn column_titles(ui: &mut egui::Ui, cols: &Cols) {
+    ui.horizontal(|ui| {
+        ui.set_height(18.0);
+        ui.spacing_mut().item_spacing.x = Cols::GAP;
+        cell(ui, cols.tick, egui::Align::Center, |_| {});
+        cell(ui, cols.role, egui::Align::Min, |ui| {
+            ui.label(muted("Holds"));
+        });
+        cell(ui, cols.name, egui::Align::Min, |ui| {
+            ui.label(muted("File"));
+        });
+        cell(ui, cols.rows, egui::Align::Max, |ui| {
+            ui.label(muted("Values"));
+        });
+        cell(ui, cols.span, egui::Align::Min, |ui| {
+            ui.label(muted("Logged from"));
+        });
+        cell(ui, cols.size, egui::Align::Max, |ui| {
+            ui.label(muted("Size"));
+        });
+        cell(ui, cols.drop, egui::Align::Center, |_| {});
+    });
+    ui.separator();
+}
+
+/// One file: the tick, what it holds, its name, and how much of it is taken.
+fn source_row(
+    ui: &mut egui::Ui,
+    src: &mut Source,
+    cols: &Cols,
+    index: usize,
+    shaded: bool,
+) -> Option<RowAct> {
+    let mut act: Option<RowAct> = None;
+    let full_path = src.path().display().to_string();
+
+    let out = ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("file-row", index))
+            .sense(egui::Sense::click()),
+        |ui| {
+            // Kept for later, so the background can be painted under the row
+            // once it is known whether the pointer is on it.
+            let bg = ui.painter().add(egui::Shape::Noop);
+            ui.horizontal(|ui| {
+                ui.set_height(FILE_ROW);
+                ui.spacing_mut().item_spacing.x = Cols::GAP;
+                let shift = ui.input(|i| i.modifiers.shift);
+
+                cell(ui, cols.tick, egui::Align::Center, |ui| {
+                    let mut on = src.on;
+                    if ui
+                        .add(egui::Checkbox::without_text(&mut on))
+                        .on_hover_text("Include this file in the import")
+                        .clicked()
+                    {
+                        act = Some(RowAct::Toggle(index, shift));
+                    }
+                });
+
+                cell(ui, cols.role, egui::Align::Min, |ui| {
+                    let (text, color) = match (src.probe.has_tags, src.probe.has_values) {
+                        (true, true) => ("tags + values", ACCENT),
+                        (true, false) => ("tag names", WARN),
+                        _ => ("values", OK),
+                    };
+                    theme::chip(ui, text, if src.on { color } else { DIM });
+                });
+
+                cell(ui, cols.name, egui::Align::Min, |ui| {
+                    let name = file_name(src.path());
+                    let text = if src.on {
+                        strong(name)
+                    } else {
+                        body(name).color(DIM)
+                    };
+                    if ui
+                        .add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(format!("{full_path}\n\nClick to show in Explorer"))
+                        .clicked()
+                    {
+                        act = Some(RowAct::Reveal(index));
+                    }
+                });
+
+                cell(ui, cols.rows, egui::Align::Max, |ui| {
+                    row_amount(ui, src);
+                });
+
+                cell(ui, cols.span, egui::Align::Min, |ui| match src.span() {
+                    Some((a, b)) => {
+                        let text = format!(
+                            "{}   +{}",
+                            convert::filetime_to_short(a),
+                            duration_text(b - a)
+                        );
+                        ui.add(
+                            egui::Label::new(if src.on { muted(text) } else { muted(text).color(DIM) })
+                                .truncate(),
+                        )
+                        .on_hover_text(format!(
+                            "{}\nto {}",
+                            convert::filetime_to_text(a),
+                            convert::filetime_to_text(b)
+                        ));
+                    }
+                    None => {
+                        ui.label(muted("-"));
+                    }
+                });
+
+                cell(ui, cols.size, egui::Align::Max, |ui| {
+                    ui.label(muted(human_bytes(src.probe.bytes)));
+                });
+
+                cell(ui, cols.drop, egui::Align::Center, |ui| {
+                    if cross(ui)
+                        .on_hover_text("Take this file off the list")
+                        .clicked()
+                    {
+                        act = Some(RowAct::Remove(index));
+                    }
+                });
+            });
+            bg
+        },
+    );
+
+    let response = out.response;
+    let hovered = response.hovered();
+    // Clicking the row itself is the easiest way to include or exclude a file;
+    // the widgets on it keep their own clicks.
+    if response.clicked() {
+        act = Some(RowAct::Toggle(index, ui.input(|i| i.modifiers.shift)));
+    }
+    // One file on its own, without unticking the rest by hand.
+    if response.secondary_clicked() {
+        act = Some(RowAct::Only(index));
+    }
+    if hovered {
+        response.clone().on_hover_text(if src.on {
+            "Click to leave this file out    (right-click: this file only)"
+        } else {
+            "Click to include this file    (right-click: this file only)"
+        });
+    }
+
+    let fill = if hovered {
+        theme::ACCENT_FILL.gamma_multiply(0.22)
+    } else if !src.on {
+        egui::Color32::TRANSPARENT
+    } else if shaded {
+        theme::FIELD.gamma_multiply(0.45)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().set(
+        out.inner,
+        egui::epaint::RectShape::filled(
+            response.rect.expand2(egui::vec2(2.0, 0.0)),
+            egui::CornerRadius::same(4),
+            fill,
+        ),
+    );
+    act
+}
+
+/// How much this file contributes, and what it was out of.
+fn row_amount(ui: &mut egui::Ui, src: &Source) {
+    if !src.probe.has_values {
+        ui.label(muted(format!("{} tags", sep(src.probe.tag_count))));
+        return;
+    }
+    match &src.kept {
+        Count::Counting => {
+            ui.spinner();
+        }
+        Count::Bad(e) => {
+            ui.label(muted("--").color(BAD)).on_hover_text(e.clone());
+        }
+        Count::Whole => {
+            let text = sep(src.probe.value_rows);
+            ui.label(if src.on { body(text) } else { body(text).color(DIM) })
+                .on_hover_text("Every value in the file, because no time range is set");
+        }
+        Count::Kept(k) => {
+            let text = sep(k.rows);
+            let color = if !src.on {
+                DIM
+            } else if k.rows == 0 {
+                BAD
+            } else if k.rows < k.total_rows {
+                WARN
+            } else {
+                TEXT
+            };
+            ui.label(body(text).color(color)).on_hover_text(format!(
+                "{} of the {} values in this file are inside the time range",
+                sep(k.rows),
+                sep(k.total_rows)
+            ));
+        }
+    }
+}
+
+/// A little x, drawn rather than written, to take a row off the list.
+fn cross(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    let color = if response.hovered() { BAD } else { DIM };
+    let r = 4.0;
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.6, color);
+    ui.painter().line_segment([c - egui::vec2(r, r), c + egui::vec2(r, r)], stroke);
+    ui.painter().line_segment([c + egui::vec2(r, -r), c + egui::vec2(-r, r)], stroke);
+    response
+}
+
+/// A fixed-width box inside a row, so every column lines up down the table.
+fn cell(ui: &mut egui::Ui, width: f32, align: egui::Align, add: impl FnOnce(&mut egui::Ui)) {
+    if width <= 0.0 {
+        return;
+    }
+    let layout = match align {
+        egui::Align::Max => egui::Layout::right_to_left(egui::Align::Center),
+        _ => egui::Layout::left_to_right(egui::Align::Center),
+    };
+    ui.allocate_ui_with_layout(egui::vec2(width, FILE_ROW), layout, |ui| {
+        ui.set_width(width);
+        add(ui);
+    });
+}
+
+/// `9 h 7 m`, `1 d 9 h`, `38 s` -- how long a file covers, in two parts at most.
+fn duration_text(ticks: i64) -> String {
+    let secs = (ticks / 10_000_000).max(0);
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    match (d, h, m) {
+        (0, 0, 0) => format!("{s} s"),
+        (0, 0, _) => format!("{m} m"),
+        (0, _, _) => format!("{h} h {m} m"),
+        _ => format!("{d} d {h} h"),
+    }
+}
+
 // ---------------------------------------------------------------- columns
 
 /// One line of the column chooser.
@@ -1794,7 +2584,10 @@ impl ColumnRow {
             .into_iter()
             .map(|source| Self {
                 source,
-                on: true,
+                // Every column is offered, but the source file is left unticked
+                // until it is wanted: with one database it says the same thing
+                // on every row.
+                on: Column::DEFAULT.contains(&source),
                 title: String::new(),
             })
             .collect()
@@ -2012,38 +2805,6 @@ fn kv(ui: &mut egui::Ui, key: &str, value: impl Into<String>) {
     });
 }
 
-/// One loaded database: state dot, what it is, the file (click to show it in
-/// Explorer) and what was found inside.
-fn slot_row(
-    ui: &mut egui::Ui,
-    title: &str,
-    probe: Option<&Probe>,
-    missing: &str,
-    detail: impl Fn(&Probe) -> String,
-) {
-    ui.horizontal(|ui| {
-        dot(ui, if probe.is_some() { OK } else { DIM });
-        ui.vertical(|ui| {
-            ui.label(strong(title));
-            match probe {
-                Some(p) => {
-                    if ui
-                        .link(body(file_name(&p.path)).color(ACCENT))
-                        .on_hover_text(format!("{}\n\nClick to show in Explorer", p.path.display()))
-                        .clicked()
-                    {
-                        reveal(&p.path);
-                    }
-                    ui.label(muted(detail(p)));
-                }
-                None => {
-                    ui.label(muted(missing));
-                }
-            }
-        });
-    });
-}
-
 /// One date/time input: the field, the remembered value as placeholder and as a
 /// button, and the exact instant it resolves to.
 fn range_field(ui: &mut egui::Ui, label: &str, text: &mut String, last: &str, end_of_day: bool) {
@@ -2098,10 +2859,39 @@ fn pick_databases() -> Option<Vec<PathBuf>> {
         .pick_files()
 }
 
+/// Ask for a whole folder, which is then searched for databases.
+fn pick_folder() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Select the folder the HMI wrote its databases into")
+        .pick_folder()
+        .map(|dir| vec![dir])
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+/// What every one of these strings begins with, which is how the name for the
+/// output is guessed from a row of numbered files.
+fn common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for other in &items[1..] {
+        end = end.min(
+            first
+                .char_indices()
+                .zip(other.char_indices())
+                .take_while(|((_, a), (_, b))| a == b)
+                .map(|((i, c), _)| i + c.len_utf8())
+                .last()
+                .unwrap_or(0),
+        );
+    }
+    first[..end].to_string()
 }
 
 fn stem_of(p: &Path) -> String {

@@ -391,6 +391,99 @@ fn count(conn: &Connection, table: &str) -> u64 {
     .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------- finding files
+
+/// The first bytes of every SQLite file, whatever it is called.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// How deep a dropped folder is searched for databases.
+const MAX_DEPTH: usize = 6;
+
+/// How many files are looked at before a folder is given up on, so that
+/// dropping something like `C:\` cannot hang the program.
+const MAX_FILES: usize = 4000;
+
+/// A file SQLite could open, decided by its first bytes rather than its name.
+///
+/// An HMI export names its databases `..._Werte_20260302_053000.db3`, but
+/// nothing guarantees that, so the header is what is trusted.
+pub fn looks_like_sqlite(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).is_ok() && &head == SQLITE_MAGIC
+}
+
+/// A journal belongs to a database and is never opened on its own.
+fn is_sidecar(path: &Path) -> bool {
+    let name = path.to_string_lossy().to_lowercase();
+    name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+}
+
+/// Every file worth probing behind what was dropped or picked.
+///
+/// A file given by name is kept as it is -- the user pointed at it, so if it
+/// turns out not to be a database that is worth saying. Inside a folder, only
+/// files that really are SQLite are kept, so dropping a whole export directory
+/// produces no noise about its logs and its `.ini` files.
+pub fn candidates(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut budget = MAX_FILES;
+
+    let push = |path: PathBuf, out: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>| {
+        let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.insert(key) {
+            out.push(path);
+        }
+    };
+
+    for path in paths {
+        if path.is_dir() {
+            walk(path, 0, &mut budget, &mut |file| {
+                if !is_sidecar(&file) && looks_like_sqlite(&file) {
+                    push(file, &mut out, &mut seen);
+                }
+            });
+        } else if path.is_file() && !is_sidecar(path) {
+            push(path.clone(), &mut out, &mut seen);
+        }
+    }
+    out
+}
+
+/// Every file under `dir`, folders first so that one export stays together.
+fn walk(dir: &Path, depth: usize, budget: &mut usize, found: &mut impl FnMut(PathBuf)) {
+    if depth > MAX_DEPTH || *budget == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(path),
+            Ok(t) if t.is_file() => files.push(path),
+            _ => {}
+        }
+    }
+    files.sort();
+    dirs.sort();
+    for f in files {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        found(f);
+    }
+    for d in dirs {
+        walk(&d, depth + 1, budget, found);
+    }
+}
+
 // ---------------------------------------------------------------- probing
 
 /// What a single file turned out to be.
@@ -406,6 +499,19 @@ pub struct Probe {
     pub value_rows: u64,
     /// First and last logged instant, as FILETIME ticks.
     pub span: Option<(i64, i64)>,
+    /// Size of the file on disk.
+    pub bytes: u64,
+}
+
+impl Probe {
+    /// What this file can be used for, for the table in the window.
+    pub fn role(&self) -> &'static str {
+        match (self.has_tags, self.has_values) {
+            (true, true) => "Tags + values",
+            (true, false) => "Tag names",
+            _ => "Logged values",
+        }
+    }
 }
 
 /// Inspect a file and decide, from its schema alone, which role it can play.
@@ -453,7 +559,26 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
         tag_names,
         value_rows,
         span,
+        bytes: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
     })
+}
+
+/// Every tag id and its name, taken from all the given tag databases.
+///
+/// HMI exports repeat the same tag table beside every batch of values, so the
+/// same ids usually arrive several times; the first name found for an id wins
+/// and later files only add what is new.
+pub fn read_all_tag_names(dbs: &[PathBuf]) -> Result<Vec<(i64, String)>, String> {
+    let mut by_key: HashMap<i64, String> = HashMap::new();
+    for db in dbs {
+        let conn = open_readonly(db)?;
+        for (id, name) in read_tag_names(&conn)? {
+            by_key.entry(id).or_insert(name);
+        }
+    }
+    let mut out: Vec<(i64, String)> = by_key.into_iter().collect();
+    out.sort_by_key(|(id, _)| *id);
+    Ok(out)
 }
 
 /// Every tag id and its configured name. When a tag has several configuration
@@ -517,7 +642,6 @@ pub fn ms_to_ticks(ms: i64) -> i64 {
 #[derive(Clone, Debug, Default)]
 pub struct Kept {
     pub rows: u64,
-    pub timestamps: u64,
     pub total_rows: u64,
     /// First and last instant that survives the range, as FILETIME ticks.
     pub span: Option<(i64, i64)>,
@@ -543,25 +667,21 @@ pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
         .map(|t| format!("SELECT pk_TimeStamp FROM \"{t}\"{where_sql}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let sql = format!(
-        "SELECT COUNT(*), COUNT(DISTINCT pk_TimeStamp), MIN(pk_TimeStamp), MAX(pk_TimeStamp) \
-         FROM ({inner})"
-    );
+    let sql =
+        format!("SELECT COUNT(*), MIN(pk_TimeStamp), MAX(pk_TimeStamp) FROM ({inner})");
 
-    let (rows, timestamps, lo, hi) = conn
+    let (rows, lo, hi) = conn
         .query_row(&sql, [], |r| {
             Ok((
                 r.get::<_, i64>(0)? as u64,
-                r.get::<_, i64>(1)? as u64,
+                r.get::<_, Option<i64>>(1)?,
                 r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     Ok(Kept {
         rows,
-        timestamps,
         total_rows,
         span: match (lo, hi) {
             (Some(a), Some(b)) => Some((a, b)),
@@ -588,11 +708,26 @@ pub enum Column {
     Name,
     /// 192 means good; anything else is doubtful.
     Quality,
+    /// Which of the imported databases the row was read from.
+    File,
 }
 
 impl Column {
     /// Every column there is, in the order they are written by default.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
+        Self::Time,
+        Self::TimeRaw,
+        Self::Id,
+        Self::Value,
+        Self::Name,
+        Self::Quality,
+        Self::File,
+    ];
+
+    /// The columns written unless the user says otherwise. The source file is
+    /// left out, because most exports come from one file and then the column
+    /// would say the same thing on every row.
+    pub const DEFAULT: [Self; 6] = [
         Self::Time,
         Self::TimeRaw,
         Self::Id,
@@ -610,6 +745,7 @@ impl Column {
             Self::Value => "Value",
             Self::Name => "Name",
             Self::Quality => "Quality",
+            Self::File => "SourceFile",
         }
     }
 
@@ -622,6 +758,7 @@ impl Column {
             Self::Value => "the logged value",
             Self::Name => "tag name",
             Self::Quality => "192 is good, anything else doubtful",
+            Self::File => "the database file the row came from",
         }
     }
 
@@ -634,6 +771,7 @@ impl Column {
             Self::Value => "value",
             Self::Name => "name",
             Self::Quality => "quality",
+            Self::File => "file",
         }
     }
 
@@ -663,17 +801,20 @@ impl OutColumn {
         }
     }
 
-    /// Every column, in the order they are written by default.
+    /// The columns written unless the user says otherwise.
     pub fn all() -> Vec<Self> {
-        Column::ALL.into_iter().map(Self::new).collect()
+        Column::DEFAULT.into_iter().map(Self::new).collect()
     }
 }
 
 // ---------------------------------------------------------------- job
 
 pub struct Job {
-    pub tags_db: PathBuf,
-    pub values_db: PathBuf,
+    /// Every database that holds tag names. They are merged; may be empty, and
+    /// then tags are written as `id_<number>`.
+    pub tag_dbs: Vec<PathBuf>,
+    /// Every database that holds logged values, merged into one time order.
+    pub value_dbs: Vec<PathBuf>,
     pub out_dir: PathBuf,
     pub base_name: String,
     pub semicolon: bool,
@@ -699,6 +840,9 @@ pub enum Progress {
 pub struct Summary {
     /// Written file and how many data rows it holds.
     pub files: Vec<(PathBuf, u64)>,
+    /// Each imported value database and how many of its rows were written, so
+    /// the finished screen can account for every file.
+    pub sources: Vec<(PathBuf, u64)>,
     pub rows: u64,
     pub timestamps: u64,
     pub tags_used: usize,
@@ -708,6 +852,235 @@ pub struct Summary {
     /// First and last instant actually written, as FILETIME ticks.
     pub span: Option<(i64, i64)>,
     pub secs: f32,
+}
+
+// ------------------------------------------------- reading several databases
+
+/// One logged value, as it travels from a reader thread to the writer.
+struct ValueRow {
+    ts: i64,
+    id: i64,
+    quality: i64,
+    value: String,
+}
+
+/// How many rows a reader thread hands over at a time.
+const MERGE_BATCH: usize = 4096;
+/// How many batches may wait per file before its reader has to slow down.
+const MERGE_AHEAD: usize = 3;
+
+/// The logged values of any number of databases, in one global time order.
+///
+/// An HMI logs into a new file every so often, so a day of history arrives as
+/// a row of files. Each is read on its own thread -- they are separate files,
+/// so the reading overlaps -- and the rows are merged here. Everything below
+/// therefore stays a single sorted pass, whatever the number of files.
+struct ValueStream {
+    feeds: Vec<Feed>,
+}
+
+struct Feed {
+    rx: std::sync::mpsc::Receiver<Result<Vec<ValueRow>, String>>,
+    batch: std::vec::IntoIter<ValueRow>,
+    /// The next row of this file, once it is known.
+    head: Option<ValueRow>,
+    ended: bool,
+}
+
+impl Feed {
+    /// Make sure `head` holds this file's next row, if it has one left.
+    fn fill(&mut self) -> Result<(), String> {
+        if self.head.is_some() {
+            return Ok(());
+        }
+        loop {
+            if let Some(row) = self.batch.next() {
+                self.head = Some(row);
+                return Ok(());
+            }
+            if self.ended {
+                return Ok(());
+            }
+            match self.rx.recv() {
+                Ok(Ok(batch)) => self.batch = batch.into_iter(),
+                Ok(Err(e)) => {
+                    self.ended = true;
+                    return Err(e);
+                }
+                // The thread finished and dropped its end of the channel.
+                Err(_) => {
+                    self.ended = true;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+impl ValueStream {
+    /// Start one reader per database. Dropping the stream stops them all,
+    /// because their sends then fail.
+    fn open(dbs: &[PathBuf], range: Range, cancel: &Arc<AtomicBool>) -> Self {
+        let mut feeds = Vec::with_capacity(dbs.len());
+        for db in dbs {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<ValueRow>, String>>(
+                MERGE_AHEAD,
+            );
+            let path = db.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = read_one(&path, range, &cancel, &tx) {
+                    let _ = tx.send(Err(format!("{}: {e}", short_name(&path))));
+                }
+            });
+            feeds.push(Feed {
+                rx,
+                batch: Vec::new().into_iter(),
+                head: None,
+                ended: false,
+            });
+        }
+        Self { feeds }
+    }
+
+    /// The earliest row not yet handed out, and which file it came from.
+    fn next(&mut self) -> Result<Option<(usize, ValueRow)>, String> {
+        for feed in &mut self.feeds {
+            feed.fill()?;
+        }
+        let mut best: Option<usize> = None;
+        for (i, feed) in self.feeds.iter().enumerate() {
+            let Some(head) = &feed.head else { continue };
+            let better = match best {
+                None => true,
+                Some(b) => match &self.feeds[b].head {
+                    Some(h) => (head.ts, head.id) < (h.ts, h.id),
+                    None => true,
+                },
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        Ok(best.and_then(|i| self.feeds[i].head.take().map(|row| (i, row))))
+    }
+}
+
+/// One file's rows, sorted and sent off in batches.
+fn read_one(
+    path: &Path,
+    range: Range,
+    cancel: &Arc<AtomicBool>,
+    tx: &std::sync::mpsc::SyncSender<Result<Vec<ValueRow>, String>>,
+) -> Result<(), String> {
+    let conn = open_readonly(path)?;
+    let present = table_names(&conn)?;
+    let used: Vec<&str> = VALUE_TABLES
+        .iter()
+        .copied()
+        .filter(|t| present.contains(*t))
+        .collect();
+    if used.is_empty() {
+        return Err(format!("holds no {MAIN_VALUE_TABLE} table"));
+    }
+
+    let where_sql = range.where_sql();
+    let sql = used
+        .iter()
+        .map(|t| format!("SELECT pk_TimeStamp, pk_fk_Id, Quality, Value FROM \"{t}\"{where_sql}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+        + " ORDER BY pk_TimeStamp, pk_fk_Id";
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+
+    let mut batch: Vec<ValueRow> = Vec::with_capacity(MERGE_BATCH);
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        batch.push(ValueRow {
+            ts: row.get(0).map_err(|e| e.to_string())?,
+            id: row.get(1).map_err(|e| e.to_string())?,
+            quality: row.get(2).unwrap_or(-1),
+            value: text_of(row.get_ref(3).map_err(|e| e.to_string())?),
+        });
+        if batch.len() == MERGE_BATCH && tx.send(Ok(std::mem::take(&mut batch))).is_err() {
+            // Nobody is listening any more: the conversion was cancelled.
+            return Ok(());
+        }
+        if batch.capacity() < MERGE_BATCH {
+            batch.reserve(MERGE_BATCH);
+        }
+    }
+    if !batch.is_empty() {
+        let _ = tx.send(Ok(batch));
+    }
+    Ok(())
+}
+
+/// Whatever the column holds, as the text the CSV will carry.
+fn text_of(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Null => String::new(),
+        rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+        rusqlite::types::ValueRef::Real(f) => f.to_string(),
+        rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        rusqlite::types::ValueRef::Blob(b) => {
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("0x");
+            for byte in b {
+                s.push_str(&format!("{byte:02x}"));
+            }
+            s
+        }
+    }
+}
+
+/// Just the file name, for messages about one of many files.
+pub fn short_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// How many rows one database holds inside the window, and which tag ids
+/// occur in it.
+fn survey(path: &Path, range: Range) -> Result<(u64, BTreeSet<i64>), String> {
+    let conn = open_readonly(path)?;
+    let present = table_names(&conn)?;
+    let used: Vec<&str> = VALUE_TABLES
+        .iter()
+        .copied()
+        .filter(|t| present.contains(*t))
+        .collect();
+    if used.is_empty() {
+        return Err(format!(
+            "{} holds no {MAIN_VALUE_TABLE} table",
+            short_name(path)
+        ));
+    }
+    let where_sql = range.where_sql();
+    let mut rows = 0u64;
+    let mut ids: BTreeSet<i64> = BTreeSet::new();
+    for t in &used {
+        rows += conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM \"{t}\"{where_sql}"),
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .unwrap_or(0);
+        let mut stmt = conn
+            .prepare(&format!("SELECT DISTINCT pk_fk_Id FROM \"{t}\"{where_sql}"))
+            .map_err(|e| e.to_string())?;
+        let mut found = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = found.next().map_err(|e| e.to_string())? {
+            ids.insert(r.get(0).map_err(|e| e.to_string())?);
+        }
+    }
+    Ok((rows, ids))
 }
 
 /// Append one CSV field, quoting it only when it has to be quoted.
@@ -734,10 +1107,13 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         let _ = tx.send(Progress::Stage(s.to_string()));
     };
 
+    if job.value_dbs.is_empty() {
+        return Err("no database with logged values was chosen".into());
+    }
+
     // -- 1. tag names ------------------------------------------------------
     say("Reading tag names");
-    let tags = open_readonly(&job.tags_db)?;
-    let listed = read_tag_names(&tags)?;
+    let listed = read_all_tag_names(&job.tag_dbs)?;
     let tags_total = listed.len();
     let names: HashMap<i64, String> = if job.shorten_names {
         shorten_tag_names(&listed)
@@ -745,54 +1121,34 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         listed.into_iter().collect()
     };
 
-    // -- 2. find out what the value database actually holds -----------------
-    say("Scanning logged values");
-    let vals = open_readonly(&job.values_db)?;
-    let present = table_names(&vals)?;
-    let used: Vec<&str> = VALUE_TABLES
-        .iter()
-        .copied()
-        .filter(|t| present.contains(*t))
-        .collect();
-    if used.is_empty() {
-        return Err(format!(
-            "{} holds no {MAIN_VALUE_TABLE} table",
-            job.values_db.display()
-        ));
+    // -- 2. find out what the chosen databases actually hold ----------------
+    say(&format!(
+        "Scanning {} {}",
+        job.value_dbs.len(),
+        if job.value_dbs.len() == 1 {
+            "database"
+        } else {
+            "databases"
+        }
+    ));
+    // Every tag id that really occurs in the window, across all the files:
+    // this is the column order of the wide table.
+    let mut id_set: BTreeSet<i64> = BTreeSet::new();
+    let mut total: u64 = 0;
+    for db in &job.value_dbs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let (rows, ids) = survey(db, job.range)?;
+        total += rows;
+        id_set.extend(ids);
     }
-
-    // Everything below counts and reads only the chosen time window.
-    let where_sql = job.range.where_sql();
-    let total: u64 = used
-        .iter()
-        .map(|t| {
-            vals.query_row(
-                &format!("SELECT COUNT(*) FROM \"{t}\"{where_sql}"),
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n as u64)
-            .unwrap_or(0)
-        })
-        .sum();
     if total == 0 {
         return Err(if job.range.is_open() {
-            "the value database contains no logged values".into()
+            "the chosen databases contain no logged values".into()
         } else {
             "no logged values fall inside the chosen time range".to_string()
         });
-    }
-
-    // Column order of the wide table: every tag id that really occurs in the window.
-    let mut id_set: BTreeSet<i64> = BTreeSet::new();
-    for t in &used {
-        let mut stmt = vals
-            .prepare(&format!("SELECT DISTINCT pk_fk_Id FROM \"{t}\"{where_sql}"))
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
-            id_set.insert(r.get(0).map_err(|e| e.to_string())?);
-        }
     }
     let ids: Vec<i64> = id_set.into_iter().collect();
     let col_of: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
@@ -856,16 +1212,11 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     }
 
-    // -- 4. one sorted pass over every value table -------------------------
+    // -- 4. one sorted pass over every chosen database ----------------------
     say("Converting");
-    let sql = used
-        .iter()
-        .map(|t| format!("SELECT pk_TimeStamp, pk_fk_Id, Quality, Value FROM \"{t}\"{where_sql}"))
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
-        + " ORDER BY pk_TimeStamp, pk_fk_Id";
-    let mut stmt = vals.prepare(&sql).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let source_names: Vec<String> = job.value_dbs.iter().map(|p| short_name(p)).collect();
+    let mut from_file: Vec<u64> = vec![0; job.value_dbs.len()];
+    let mut stream = ValueStream::open(&job.value_dbs, job.range, cancel);
 
     let mut done: u64 = 0;
     let mut timestamps: u64 = 0;
@@ -878,28 +1229,18 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     let mut bucket: Vec<String> = vec![String::new(); ids.len()];
     let mut bucket_ts: Option<(i64, String)> = None;
 
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+    while let Some((src, row)) = stream.next()? {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
 
-        let ts: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let id: i64 = row.get(1).map_err(|e| e.to_string())?;
-        let quality: i64 = row.get(2).unwrap_or(-1);
-        let value = match row.get_ref(3).map_err(|e| e.to_string())? {
-            rusqlite::types::ValueRef::Null => String::new(),
-            rusqlite::types::ValueRef::Integer(i) => i.to_string(),
-            rusqlite::types::ValueRef::Real(f) => f.to_string(),
-            rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
-            rusqlite::types::ValueRef::Blob(b) => {
-                let mut s = String::with_capacity(2 + b.len() * 2);
-                s.push_str("0x");
-                for byte in b {
-                    s.push_str(&format!("{byte:02x}"));
-                }
-                s
-            }
-        };
+        let ValueRow {
+            ts,
+            id,
+            quality,
+            value,
+        } = row;
+        from_file[src] += 1;
 
         if quality != QUALITY_GOOD {
             bad_quality += 1;
@@ -930,6 +1271,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
                     Column::Value => field(&mut line, &value, delim),
                     Column::Name => field(&mut line, &header_name(id), delim),
                     Column::Quality => field(&mut line, &quality.to_string(), delim),
+                    Column::File => field(&mut line, &source_names[src], delim),
                 }
             }
             line.push('\n');
@@ -978,6 +1320,12 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
 
     Ok(Summary {
         files,
+        sources: job
+            .value_dbs
+            .iter()
+            .cloned()
+            .zip(from_file.iter().copied())
+            .collect(),
         rows: done,
         timestamps,
         tags_used: ids.len(),
@@ -1187,9 +1535,15 @@ mod tests {
                 "pk_fk_Id",
                 "Value",
                 "Name",
-                "Quality"
+                "Quality",
+                "SourceFile",
             ]
         );
+        // The source file is offered but not written unless it is asked for,
+        // so a single-file export reads exactly as it always did.
+        let default: Vec<&str> = Column::DEFAULT.iter().map(|c| c.header()).collect();
+        assert_eq!(default, all[..6]);
+        assert!(!Column::DEFAULT.contains(&Column::File));
     }
 
     #[test]
