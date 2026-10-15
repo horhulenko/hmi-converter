@@ -575,6 +575,10 @@ struct App {
     pending_since: std::time::Instant,
     counter: (Sender<CountReply>, Receiver<CountReply>),
     counter_gen: u64,
+    /// The same number where the counting thread can see it: when it moves on,
+    /// a thread halfway through a folder of large files gives up rather than
+    /// scanning for an answer nobody wants any more.
+    counting_now: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The windows and the files a set of counts belongs to.
@@ -615,6 +619,7 @@ impl App {
             pending_since: std::time::Instant::now(),
             counter: channel(),
             counter_gen: 0,
+            counting_now: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         if !preload.is_empty() {
             app.accept(preload);
@@ -920,10 +925,15 @@ impl App {
 
         self.counter_gen += 1;
         let seq = self.counter_gen;
+        self.counting_now.store(seq, Ordering::Relaxed);
         let tx = self.counter.0.clone();
         let ctx = ctx.clone();
+        let live = self.counting_now.clone();
         thread::spawn(move || {
             for path in files {
+                if live.load(Ordering::Relaxed) != seq {
+                    return;
+                }
                 let kept = convert::count_kept(&path, &windows);
                 if tx.send((seq, path, kept)).is_err() {
                     return;
