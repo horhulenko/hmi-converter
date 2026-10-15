@@ -1363,8 +1363,9 @@ impl App {
             }
             ui.add_space(8.0);
             let cols = Cols::new(ui.available_width());
+            let room = (ui.available_height() - BELOW_TABLE).clamp(TABLE_MIN_H, TABLE_MAX_H);
             column_titles(ui, &cols);
-            self.table_rows(ui, &cols);
+            self.table_rows(ui, &cols, room);
             ui.add_space(6.0);
             self.table_foot(ui);
         });
@@ -1444,7 +1445,7 @@ impl App {
     }
 
     /// One row per file, and whatever was clicked on them.
-    fn table_rows(&mut self, ui: &mut egui::Ui, cols: &Cols) {
+    fn table_rows(&mut self, ui: &mut egui::Ui, cols: &Cols, room: f32) {
         let needle = self.filter.trim().to_lowercase();
         let shown: Vec<usize> = (0..self.sources.len())
             .filter(|&i| {
@@ -1460,7 +1461,7 @@ impl App {
             .id_salt("sources")
             // Only as tall as the rows need, until there are enough of them to
             // push the rest of the window out of sight.
-            .max_height(TABLE_MAX_H)
+            .max_height(room)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 if shown.is_empty() {
@@ -1558,20 +1559,24 @@ impl App {
                     .color(WARN),
             );
         }
+        // One line, whatever the number of pairs: the files are named in the
+        // table above, and the first pair in the hover text.
         let overlaps = self.overlaps();
         if let Some((a, b)) = overlaps.first() {
             ui.label(
-                body(format!(
-                    "{a} and {b} cover the same period{} -- those readings would \
-                     be written twice.",
-                    if overlaps.len() > 1 {
-                        format!(", and {} other pair(s) do", overlaps.len() - 1)
-                    } else {
-                        String::new()
-                    }
-                ))
+                body(match overlaps.len() {
+                    1 => format!(
+                        "{a} and {b} cover the same period -- those readings \
+                         would be written twice."
+                    ),
+                    n => format!(
+                        "{n} pairs of files cover the same period -- those \
+                         readings would be written twice."
+                    ),
+                })
                 .color(WARN),
-            );
+            )
+            .on_hover_text(format!("for example\n{a}\nand\n{b}"));
         }
     }
 
@@ -2524,10 +2529,14 @@ impl App {
 
 /// Height of one row of the file table.
 const FILE_ROW: f32 = 25.0;
-/// The table starts scrolling only past this height -- about ten files -- so
-/// that the usual handful never has a scrollbar, and three hundred do not push
-/// the rest of the window out of sight.
-const TABLE_MAX_H: f32 = 268.0;
+/// Roughly what the cards under the table need: the timeline and its dates,
+/// what to write, and the gaps between them. Whatever is left over is the
+/// table's, so a taller window simply shows more files.
+const BELOW_TABLE: f32 = 358.0;
+/// ...but never less than four rows, and never so many that the window is
+/// nothing but file names.
+const TABLE_MIN_H: f32 = 100.0;
+const TABLE_MAX_H: f32 = 420.0;
 
 /// What a click on one row of the file table asked for.
 enum RowAct {

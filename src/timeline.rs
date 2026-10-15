@@ -59,7 +59,13 @@ pub fn ui(
     selected: &mut usize,
     grab: &mut Option<Grab>,
 ) -> bool {
-    let lane_rows = lanes.len().min(MAX_LANES).max(1);
+    // Past a handful of files the bars would be hairlines, so they are all
+    // drawn into one band -- and then only one row is needed.
+    let lane_rows = if lanes.len() > MAX_LANES {
+        1
+    } else {
+        lanes.len().max(1)
+    };
     let height = AXIS_H + lane_rows as f32 * (LANE_H + LANE_GAP) + 6.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
