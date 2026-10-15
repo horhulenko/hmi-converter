@@ -40,10 +40,6 @@ pub const BAD: Color32 = Color32::from_rgb(0xF2, 0x7B, 0x7B);
 /// The single vertical rhythm used between and inside cards.
 pub const GAP: f32 = 8.0;
 
-/// Minimum height of the two cards that sit side by side, so they end at the
-/// same line however much each has to say.
-pub const ROW_BOTTOM: f32 = 104.0;
-
 const RADIUS: u8 = 6;
 const SIZE_HEADING: f32 = 20.0;
 const SIZE_LEAD: f32 = 16.0;

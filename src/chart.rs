@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use crate::convert::{self, Progress, Range};
+use crate::convert::{self, Progress, Windows};
 
 /// The charting library, kept beside the program so nothing is fetched.
 const ECHARTS: &str = include_str!("../assets/echarts.min.js");
@@ -69,7 +69,7 @@ pub struct ChartJob {
     pub value_dbs: Vec<PathBuf>,
     pub out_dir: PathBuf,
     pub base_name: String,
-    pub range: Range,
+    pub windows: Windows,
     pub shorten_names: bool,
     pub detail: Detail,
 }
@@ -197,7 +197,7 @@ pub fn load(
     // One file at a time, each tag collecting its own points. Several files are
     // one log cut into pieces, so the points of a tag are put back together
     // and sorted once at the end.
-    let where_sql = convert::range_where(job.range);
+    let where_sql = convert::range_where(&job.windows);
     let mut text_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     let mut points: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
     let mut order: Vec<i64> = Vec::new();

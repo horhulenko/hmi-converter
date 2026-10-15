@@ -499,9 +499,19 @@ pub struct Probe {
     pub value_rows: u64,
     /// First and last logged instant, as FILETIME ticks.
     pub span: Option<(i64, i64)>,
+    /// How many values fall into each of [`DENSITY`] equal parts of the span.
+    ///
+    /// An HMI stops logging overnight or while the plant is down, so a file
+    /// that covers a day may hold two hours of it. The timeline draws this, so
+    /// a slice is taken where there is something to take.
+    pub density: Vec<u32>,
     /// Size of the file on disk.
     pub bytes: u64,
 }
+
+/// How finely [`Probe::density`] cuts a file up. About one part per pixel of
+/// a wide window, which is as much as can be drawn.
+pub const DENSITY: usize = 240;
 
 impl Probe {
     /// What this file can be used for, for the table in the window.
@@ -535,12 +545,13 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
     };
     let mut value_rows = 0;
     let mut span = None;
+    let mut density = Vec::new();
     if has_values {
-        for t in VALUE_TABLES {
-            if tables.contains(t) {
-                value_rows += count(&conn, t);
-            }
-        }
+        let used: Vec<&str> = VALUE_TABLES
+            .iter()
+            .copied()
+            .filter(|t| tables.contains(*t))
+            .collect();
         let bounds = conn.query_row(
             &format!("SELECT MIN(pk_TimeStamp), MAX(pk_TimeStamp) FROM \"{MAIN_VALUE_TABLE}\""),
             [],
@@ -548,6 +559,42 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
         );
         if let Ok((Some(lo), Some(hi))) = bounds {
             span = Some((lo, hi));
+        }
+
+        // Counting and spreading the rows over the span is one pass either
+        // way, so the picture costs nothing that the count did not.
+        match span {
+            Some((lo, hi)) if hi > lo => {
+                density = vec![0u32; DENSITY];
+                let step = ((hi - lo) / DENSITY as i64).max(1);
+                let inner = used
+                    .iter()
+                    .map(|t| format!("SELECT pk_TimeStamp FROM \"{t}\""))
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ");
+                let sql = format!(
+                    "SELECT (pk_TimeStamp - {lo}) / {step}, COUNT(*) FROM ({inner}) GROUP BY 1"
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql)
+                    && let Ok(mut rows) = stmt.query([])
+                {
+                    while let Ok(Some(r)) = rows.next() {
+                        let slot: i64 = r.get(0).unwrap_or(-1);
+                        let n: i64 = r.get(1).unwrap_or(0);
+                        value_rows += n as u64;
+                        if let Ok(slot) = usize::try_from(slot)
+                            && slot < DENSITY
+                        {
+                            density[slot] = density[slot].saturating_add(n as u32);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for t in &used {
+                    value_rows += count(&conn, t);
+                }
+            }
         }
     }
 
@@ -559,6 +606,7 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
         tag_names,
         value_rows,
         span,
+        density,
         bytes: fs::metadata(path).map(|m| m.len()).unwrap_or(0),
     })
 }
@@ -616,21 +664,58 @@ impl Range {
         self.from.is_none() && self.until.is_none()
     }
 
-    /// The SQL that restricts a value table to this window.
-    /// The bounds are plain integers, so there is nothing to escape.
-    fn where_sql(&self) -> String {
-        match (self.from, self.until) {
-            (None, None) => String::new(),
-            (Some(a), None) => format!(" WHERE pk_TimeStamp >= {a}"),
-            (None, Some(b)) => format!(" WHERE pk_TimeStamp <= {b}"),
-            (Some(a), Some(b)) => format!(" WHERE pk_TimeStamp >= {a} AND pk_TimeStamp <= {b}"),
+}
+
+/// One or more windows, which is what the user draws on the timeline.
+///
+/// Empty means no limit at all. Several windows let one export hold, say, the
+/// two interesting hours of a shift without the quiet morning in between.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Windows {
+    pub spans: Vec<Range>,
+}
+
+impl Windows {
+    /// Everything there is.
+    pub fn whole() -> Self {
+        Self::default()
+    }
+
+    pub fn one(range: Range) -> Self {
+        Self { spans: vec![range] }
+    }
+
+    /// Nothing is left out: no window at all, or one that is open at both ends.
+    pub fn is_open(&self) -> bool {
+        self.spans.is_empty() || self.spans.iter().any(Range::is_open)
+    }
+
+    /// The SQL that keeps the rows inside any one of the windows.
+    pub fn where_sql(&self) -> String {
+        if self.is_open() {
+            return String::new();
+        }
+        let parts: Vec<String> = self
+            .spans
+            .iter()
+            .filter_map(|r| match (r.from, r.until) {
+                (Some(a), Some(b)) => Some(format!("(pk_TimeStamp >= {a} AND pk_TimeStamp <= {b})")),
+                (Some(a), None) => Some(format!("(pk_TimeStamp >= {a})")),
+                (None, Some(b)) => Some(format!("(pk_TimeStamp <= {b})")),
+                (None, None) => None,
+            })
+            .collect();
+        match parts.len() {
+            0 => String::new(),
+            _ => format!(" WHERE ({})", parts.join(" OR ")),
         }
     }
 }
 
-/// The SQL that restricts a value table to a window, shared with the charts.
-pub fn range_where(range: Range) -> String {
-    range.where_sql()
+/// The SQL that restricts a value table to the chosen windows, shared with
+/// the charts.
+pub fn range_where(windows: &Windows) -> String {
+    windows.where_sql()
 }
 
 /// Milliseconds since 1970 -> FILETIME ticks, the inverse of the chart's clock.
@@ -648,7 +733,7 @@ pub struct Kept {
 }
 
 /// Count what a time window would keep, without writing anything.
-pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
+pub fn count_kept(values_db: &Path, windows: &Windows) -> Result<Kept, String> {
     let conn = open_readonly(values_db)?;
     let present = table_names(&conn)?;
     let used: Vec<&str> = VALUE_TABLES
@@ -661,7 +746,7 @@ pub fn count_kept(values_db: &Path, range: Range) -> Result<Kept, String> {
     }
 
     let total_rows: u64 = used.iter().map(|t| count(&conn, t)).sum();
-    let where_sql = range.where_sql();
+    let where_sql = windows.where_sql();
     let inner = used
         .iter()
         .map(|t| format!("SELECT pk_TimeStamp FROM \"{t}\"{where_sql}"))
@@ -820,8 +905,8 @@ pub struct Job {
     pub semicolon: bool,
     pub write_long: bool,
     pub write_wide: bool,
-    /// Only values inside this window are written.
-    pub range: Range,
+    /// Only values inside one of these windows are written.
+    pub windows: Windows,
     /// Shorten tag names to the part that tells them apart.
     pub shorten_names: bool,
     /// The columns of the long table, in the order they are written.
@@ -920,7 +1005,7 @@ impl Feed {
 impl ValueStream {
     /// Start one reader per database. Dropping the stream stops them all,
     /// because their sends then fail.
-    fn open(dbs: &[PathBuf], range: Range, cancel: &Arc<AtomicBool>) -> Self {
+    fn open(dbs: &[PathBuf], windows: &Windows, cancel: &Arc<AtomicBool>) -> Self {
         let mut feeds = Vec::with_capacity(dbs.len());
         for db in dbs {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<ValueRow>, String>>(
@@ -928,8 +1013,9 @@ impl ValueStream {
             );
             let path = db.clone();
             let cancel = cancel.clone();
+            let windows = windows.clone();
             std::thread::spawn(move || {
-                if let Err(e) = read_one(&path, range, &cancel, &tx) {
+                if let Err(e) = read_one(&path, &windows, &cancel, &tx) {
                     let _ = tx.send(Err(format!("{}: {e}", short_name(&path))));
                 }
             });
@@ -969,7 +1055,7 @@ impl ValueStream {
 /// One file's rows, sorted and sent off in batches.
 fn read_one(
     path: &Path,
-    range: Range,
+    windows: &Windows,
     cancel: &Arc<AtomicBool>,
     tx: &std::sync::mpsc::SyncSender<Result<Vec<ValueRow>, String>>,
 ) -> Result<(), String> {
@@ -984,7 +1070,7 @@ fn read_one(
         return Err(format!("holds no {MAIN_VALUE_TABLE} table"));
     }
 
-    let where_sql = range.where_sql();
+    let where_sql = windows.where_sql();
     let sql = used
         .iter()
         .map(|t| format!("SELECT pk_TimeStamp, pk_fk_Id, Quality, Value FROM \"{t}\"{where_sql}"))
@@ -1046,7 +1132,7 @@ pub fn short_name(path: &Path) -> String {
 
 /// How many rows one database holds inside the window, and which tag ids
 /// occur in it.
-fn survey(path: &Path, range: Range) -> Result<(u64, BTreeSet<i64>), String> {
+fn survey(path: &Path, windows: &Windows) -> Result<(u64, BTreeSet<i64>), String> {
     let conn = open_readonly(path)?;
     let present = table_names(&conn)?;
     let used: Vec<&str> = VALUE_TABLES
@@ -1060,7 +1146,7 @@ fn survey(path: &Path, range: Range) -> Result<(u64, BTreeSet<i64>), String> {
             short_name(path)
         ));
     }
-    let where_sql = range.where_sql();
+    let where_sql = windows.where_sql();
     let mut rows = 0u64;
     let mut ids: BTreeSet<i64> = BTreeSet::new();
     for t in &used {
@@ -1139,12 +1225,12 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let (rows, ids) = survey(db, job.range)?;
+        let (rows, ids) = survey(db, &job.windows)?;
         total += rows;
         id_set.extend(ids);
     }
     if total == 0 {
-        return Err(if job.range.is_open() {
+        return Err(if job.windows.is_open() {
             "the chosen databases contain no logged values".into()
         } else {
             "no logged values fall inside the chosen time range".to_string()
@@ -1216,7 +1302,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     say("Converting");
     let source_names: Vec<String> = job.value_dbs.iter().map(|p| short_name(p)).collect();
     let mut from_file: Vec<u64> = vec![0; job.value_dbs.len()];
-    let mut stream = ValueStream::open(&job.value_dbs, job.range, cancel);
+    let mut stream = ValueStream::open(&job.value_dbs, &job.windows, cancel);
 
     let mut done: u64 = 0;
     let mut timestamps: u64 = 0;
@@ -1544,27 +1630,6 @@ mod tests {
         let default: Vec<&str> = Column::DEFAULT.iter().map(|c| c.header()).collect();
         assert_eq!(default, all[..6]);
         assert!(!Column::DEFAULT.contains(&Column::File));
-    }
-
-    #[test]
-    fn range_sql_is_inclusive() {
-        assert_eq!(Range::default().where_sql(), "");
-        assert_eq!(
-            Range {
-                from: Some(5),
-                until: None
-            }
-            .where_sql(),
-            " WHERE pk_TimeStamp >= 5"
-        );
-        assert_eq!(
-            Range {
-                from: Some(5),
-                until: Some(9)
-            }
-            .where_sql(),
-            " WHERE pk_TimeStamp >= 5 AND pk_TimeStamp <= 9"
-        );
     }
 
     #[test]

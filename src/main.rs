@@ -8,6 +8,7 @@ mod chart;
 mod convert;
 mod plotview;
 mod theme;
+mod timeline;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use chart::{ChartJob, ChartSummary, Detail, Loaded};
-use convert::{Column, Job, Kept, OutColumn, Probe, Progress, Range, Summary};
+use convert::{Column, Job, Kept, OutColumn, Probe, Progress, Range, Summary, Windows};
 use eframe::egui;
 use plotview::PlotView;
 use theme::{ACCENT, BAD, DIM, MUTED, OK, TEXT, WARN, body, dot, lead, muted, strong};
@@ -163,6 +164,7 @@ fn cli(args: &[String]) -> i32 {
     let mut columns: Vec<OutColumn> = OutColumn::all();
     let (mut write_long, mut write_wide) = (true, true);
     let mut range = Range::default();
+    let mut windows = Windows::whole();
     let mut chart_too = false;
     let mut detail = Detail::Balanced;
 
@@ -304,6 +306,9 @@ fn cli(args: &[String]) -> i32 {
         eprintln!("Need at least one database with a LoggedProcessValue table.");
         return 2;
     }
+    if !range.is_open() {
+        windows = Windows::one(range);
+    }
     if tag_dbs.is_empty() {
         eprintln!("No LoggingTag table found -- tags will be written as id_<number>.");
     }
@@ -339,7 +344,7 @@ fn cli(args: &[String]) -> i32 {
         semicolon,
         write_long,
         write_wide,
-        range,
+        windows,
         shorten_names,
         columns,
     };
@@ -401,7 +406,7 @@ fn cli(args: &[String]) -> i32 {
         value_dbs: job.value_dbs.clone(),
         out_dir: job.out_dir.clone(),
         base_name: job.base_name.clone(),
-        range: job.range,
+        windows: job.windows.clone(),
         shorten_names: job.shorten_names,
         detail,
     };
@@ -550,8 +555,16 @@ struct App {
     drag: Option<(Column, f32)>,
 
     // -- time range
+    /// The slices of the log to convert. Empty means all of it.
+    windows: Vec<Range>,
+    /// Which slice the two fields below edit, and the timeline highlights.
+    selected: usize,
+    /// An edge or a window being dragged on the timeline.
+    grab: Option<timeline::Grab>,
     from_text: String,
     until_text: String,
+    /// What is wrong with what was typed, if anything.
+    range_error: Option<String>,
     /// The range used the last time something was converted.
     last: Settings,
     /// What the per-file counts were computed for, so they are only recomputed
@@ -564,8 +577,8 @@ struct App {
     counter_gen: u64,
 }
 
-/// The range and the files a set of counts belongs to.
-type PreviewKey = (String, String, Vec<PathBuf>);
+/// The windows and the files a set of counts belongs to.
+type PreviewKey = (Vec<Range>, Vec<PathBuf>);
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, preload: Vec<PathBuf>) -> Self {
@@ -590,8 +603,12 @@ impl App {
             long_columns: last.column_rows(),
             columns_open: false,
             drag: None,
+            windows: Vec::new(),
+            selected: 0,
+            grab: None,
             from_text: String::new(),
             until_text: String::new(),
+            range_error: None,
             last,
             preview_key: None,
             pending: None,
@@ -605,8 +622,18 @@ impl App {
         app
     }
 
-    /// The chosen window, plus a message for whatever does not parse.
-    fn range(&self) -> Result<Range, String> {
+    /// The slices to convert, plus a message for whatever does not parse.
+    fn windows(&self) -> Result<Windows, String> {
+        match &self.range_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(Windows {
+                spans: self.windows.clone(),
+            }),
+        }
+    }
+
+    /// What the two fields say, as one window.
+    fn typed_window(&self) -> Result<Option<Range>, String> {
         let from = if self.from_text.trim().is_empty() {
             None
         } else {
@@ -622,7 +649,57 @@ impl App {
         {
             return Err("From is later than Until".into());
         }
-        Ok(Range { from, until })
+        Ok(match (from, until) {
+            (None, None) => None,
+            _ => Some(Range { from, until }),
+        })
+    }
+
+    /// Take what was typed into the slice the fields belong to. Emptying both
+    /// fields drops that slice, which is how the whole log is asked for again.
+    fn text_edited(&mut self) {
+        match self.typed_window() {
+            Err(e) => self.range_error = Some(e),
+            Ok(None) => {
+                self.range_error = None;
+                if self.selected < self.windows.len() {
+                    self.windows.remove(self.selected);
+                }
+                self.selected = self.selected.min(self.windows.len().saturating_sub(1));
+            }
+            Ok(Some(w)) => {
+                self.range_error = None;
+                match self.windows.get_mut(self.selected) {
+                    Some(slot) => *slot = w,
+                    None => {
+                        self.windows.push(w);
+                        self.selected = self.windows.len() - 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write the chosen slice back into the two fields, after the timeline
+    /// has been dragged.
+    fn text_from_window(&mut self) {
+        let shown = |t: Option<i64>| t.map(convert::filetime_to_short).unwrap_or_default();
+        let (from, until) = match self.windows.get(self.selected) {
+            Some(w) => (shown(w.from), shown(w.until)),
+            None => (String::new(), String::new()),
+        };
+        self.from_text = from;
+        self.until_text = until;
+        self.range_error = None;
+    }
+
+    /// The whole period the ticked files cover, which the timeline is drawn on.
+    fn data_bounds(&self) -> Option<(i64, i64)> {
+        self.sources
+            .iter()
+            .filter(|s| s.probe.has_values)
+            .filter_map(|s| s.probe.span)
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
     }
 
     // -- the files that take part ------------------------------------------
@@ -779,7 +856,7 @@ impl App {
         !self.value_dbs().is_empty()
             && (self.write_long || self.write_wide)
             && (!self.write_long || !self.columns().is_empty())
-            && self.range().is_ok()
+            && self.windows().is_ok()
             && self.total_values() != Some(0)
     }
 
@@ -804,18 +881,14 @@ impl App {
         }
 
         let files = self.value_dbs();
-        let key: PreviewKey = (
-            self.from_text.trim().to_string(),
-            self.until_text.trim().to_string(),
-            files.clone(),
-        );
+        let key: PreviewKey = (self.windows.clone(), files.clone());
 
         // Something changed: show it at once, then let the timer run down.
         if self.preview_key.as_ref() != Some(&key) && self.pending.as_ref() != Some(&key) {
             self.pending = Some(key.clone());
             self.pending_since = std::time::Instant::now();
-            let open = self.range().map(|r| r.is_open()).unwrap_or(false);
-            let bad = self.range().err();
+            let open = self.windows().map(|w| w.is_open()).unwrap_or(false);
+            let bad = self.windows().err();
             for s in &mut self.sources {
                 if !s.probe.has_values {
                     continue;
@@ -838,8 +911,8 @@ impl App {
 
         self.pending = None;
         self.preview_key = Some(key);
-        let range = match self.range() {
-            Ok(r) if !r.is_open() => r,
+        let windows = match self.windows() {
+            Ok(w) if !w.is_open() => w,
             // Nothing to count: without a range every file is taken whole, and
             // a range that does not parse is already reported.
             _ => return,
@@ -851,7 +924,7 @@ impl App {
         let ctx = ctx.clone();
         thread::spawn(move || {
             for path in files {
-                let kept = convert::count_kept(&path, range);
+                let kept = convert::count_kept(&path, &windows);
                 if tx.send((seq, path, kept)).is_err() {
                     return;
                 }
@@ -978,8 +1051,8 @@ impl App {
         if self.value_dbs().is_empty() {
             return;
         }
-        let range = match self.range() {
-            Ok(r) => r,
+        let windows = match self.windows() {
+            Ok(w) => w,
             Err(e) => {
                 self.state = State::Failed(e);
                 return;
@@ -994,19 +1067,16 @@ impl App {
             semicolon: self.semicolon,
             write_long: self.write_long,
             write_wide: self.write_wide,
-            range,
+            windows,
             shorten_names: self.shorten_names,
             columns: self.columns(),
         };
 
         // Remember what was chosen, so the next run starts where this left off.
-        let (from, until) = (
-            self.from_text.trim().to_string(),
-            self.until_text.trim().to_string(),
-        );
-        if !(from.is_empty() && until.is_empty()) {
-            self.last.from = from;
-            self.last.until = until;
+        if let Some(w) = self.windows.first() {
+            let shown = |t: Option<i64>| t.map(convert::filetime_to_short).unwrap_or_default();
+            self.last.from = shown(w.from);
+            self.last.until = shown(w.until);
         }
         self.remember_columns();
 
@@ -1036,8 +1106,8 @@ impl App {
         if self.value_dbs().is_empty() {
             return None;
         }
-        let range = match self.range() {
-            Ok(r) => r,
+        let windows = match self.windows() {
+            Ok(w) => w,
             Err(e) => {
                 self.state = State::Failed(e);
                 return None;
@@ -1048,7 +1118,7 @@ impl App {
             value_dbs: self.value_dbs(),
             out_dir: self.out_dir(),
             base_name: self.base_name(),
-            range,
+            windows,
             shorten_names: self.shorten_names,
             detail: self.detail,
         })
@@ -1177,7 +1247,14 @@ impl eframe::App for App {
                         top: theme::GAP as i8,
                         ..egui::Margin::ZERO
                     }))
-                    .show(ui, |ui| self.convert_button(ui));
+                    .show(ui, |ui| {
+                        // Where the files go sits with the button that writes
+                        // them, so it stays in sight however long the lists
+                        // above become.
+                        self.output_view(ui);
+                        ui.add_space(theme::GAP);
+                        self.convert_button(ui);
+                    });
             }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1210,12 +1287,9 @@ impl App {
         ui.add_space(theme::GAP);
         self.sources_view(ui);
         ui.add_space(theme::GAP);
-        ui.columns(2, |c| {
-            self.range_view(&mut c[0]);
-            self.options_view(&mut c[1]);
-        });
+        self.range_view(ui);
         ui.add_space(theme::GAP);
-        self.output_view(ui);
+        self.options_view(ui);
         self.notes_view(ui);
     }
 
@@ -1501,79 +1575,240 @@ impl App {
         }
     }
 
-    /// Cut the log down to a time slice, with a live count of what survives.
+    /// Cut the log down to a slice of time -- or several -- with the files
+    /// drawn underneath, so it is clear what is being cut.
     fn range_view(&mut self, ui: &mut egui::Ui) {
+        let bounds = self.data_bounds();
+        let lanes: Vec<timeline::Lane> = self
+            .sources
+            .iter()
+            .filter(|s| s.probe.has_values)
+            .filter_map(|s| {
+                Some(timeline::Lane {
+                    name: file_name(s.path()),
+                    span: s.probe.span?,
+                    on: s.on,
+                    density: s.probe.density.clone(),
+                })
+            })
+            .collect();
+
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_BOTTOM);
-            section(ui, "Time range", "optional");
-            ui.add_space(theme::GAP);
-
-            let last_from = self.last.from.clone();
-            let last_until = self.last.until.clone();
-            range_field(ui, "From", &mut self.from_text, &last_from, false);
+            ui.horizontal(|ui| {
+                ui.label(strong("Time range"));
+                ui.label(muted(match self.windows.len() {
+                    0 => "all of it -- drag across the bar to take a slice".to_string(),
+                    1 => "one slice -- drag its edges to adjust".to_string(),
+                    n => format!("{n} slices"),
+                }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.range_buttons(ui, bounds);
+                });
+            });
             ui.add_space(4.0);
-            range_field(ui, "Until", &mut self.until_text, &last_until, true);
 
-            ui.add_space(theme::GAP);
-            let range = self.range();
-            if let Err(e) = &range {
+            // -- the picture
+            let changed = timeline::ui(
+                ui,
+                &lanes,
+                bounds,
+                &mut self.windows,
+                &mut self.selected,
+                &mut self.grab,
+            );
+            if changed {
+                self.text_from_window();
+            }
+            ui.add_space(4.0);
+
+            // -- the exact dates of whichever slice is chosen
+            ui.horizontal(|ui| {
+                let last_from = self.last.from.clone();
+                let last_until = self.last.until.clone();
+                let mut edited = false;
+                let exact = |t: Option<i64>| match t {
+                    Some(t) => format!("exactly {}", convert::filetime_to_text(t)),
+                    None => "no limit at this end".to_string(),
+                };
+                let slice = self.windows.get(self.selected).copied();
+                edited |= range_field(
+                    ui,
+                    "From",
+                    &mut self.from_text,
+                    &last_from,
+                    exact(slice.and_then(|w| w.from)),
+                );
+                ui.add_space(10.0);
+                edited |= range_field(
+                    ui,
+                    "Until",
+                    &mut self.until_text,
+                    &last_until,
+                    exact(slice.and_then(|w| w.until)),
+                );
+                if edited {
+                    self.text_edited();
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.kept_label(ui);
+                });
+            });
+
+            // -- anything that will not parse
+            if let Some(e) = &self.range_error {
                 ui.label(body(e.clone()).color(BAD));
-                return;
-            }
-            if self.value_dbs().is_empty() {
-                ui.label(muted("Tick a file with logged values to see what is kept."));
-                return;
-            }
-            if range.map(|r| r.is_open()).unwrap_or(false) {
-                ui.label(muted(
-                    "Everything in the ticked files is converted. Narrow this to \
-                     cut the log down to one day or one shift.",
-                ));
-                return;
             }
 
-            let total: u64 = self
-                .included()
-                .filter(|s| s.probe.has_values)
-                .map(|s| s.probe.value_rows)
-                .sum();
-            match self.total_values() {
-                Some(kept) => {
-                    ui.label(
-                        strong(if kept == 0 {
-                            "Nothing is left in this range.".to_string()
-                        } else {
-                            format!("Keeps {} of {} values", sep(kept), sep(total))
-                        })
-                        .color(if kept == 0 { BAD } else { OK }),
-                    );
-                    if let Some((a, b)) = self.total_span() {
-                        ui.label(muted(format!(
-                            "{}  to  {}",
-                            convert::filetime_to_short(a),
-                            convert::filetime_to_short(b)
-                        )));
-                    }
-                    let empty = self
-                        .included()
-                        .filter(|s| s.probe.has_values)
-                        .filter(|s| s.values() == Some(0))
-                        .count();
-                    if empty > 0 && kept > 0 {
-                        ui.label(muted(format!(
-                            "{empty} of the ticked files have nothing in this range"
-                        )));
-                    }
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(muted("counting..."));
-                    });
-                }
+            // -- every slice, for picking one without aiming at the timeline
+            if self.windows.len() > 1 {
+                ui.add_space(2.0);
+                self.slice_chips(ui);
             }
         });
+    }
+
+    /// Whole range / Split / Add / Remove, which is all a slice needs.
+    fn range_buttons(&mut self, ui: &mut egui::Ui, bounds: Option<(i64, i64)>) {
+        let any = !self.windows.is_empty();
+        if ui
+            .add_enabled(any, egui::Button::new("Remove slice").small())
+            .on_hover_text("Drop the chosen slice")
+            .clicked()
+        {
+            self.windows.remove(self.selected.min(self.windows.len() - 1));
+            self.selected = self.selected.min(self.windows.len().saturating_sub(1));
+            self.text_from_window();
+        }
+        if ui
+            .add_enabled(any, egui::Button::new("Split").small())
+            .on_hover_text(
+                "Cut the chosen slice in two, so the halves can be pulled apart \
+                 and the middle left out",
+            )
+            .clicked()
+            && let Some(w) = self.windows.get(self.selected).copied()
+            && let (Some(a), Some(b)) = (
+                w.from.or(bounds.map(|x| x.0)),
+                w.until.or(bounds.map(|x| x.1)),
+            )
+            && b > a + 20_000_000
+        {
+            let mid = a + (b - a) / 2;
+            self.windows[self.selected] = Range {
+                from: Some(a),
+                until: Some(mid),
+            };
+            self.windows.insert(
+                self.selected + 1,
+                Range {
+                    from: Some(mid),
+                    until: Some(b),
+                },
+            );
+            self.text_from_window();
+        }
+        if ui
+            .add_enabled(bounds.is_some(), egui::Button::new("Add slice").small())
+            .on_hover_text("Another slice, over the middle of the log")
+            .clicked()
+            && let Some((a, b)) = bounds
+        {
+            let quarter = (b - a) / 4;
+            self.windows.push(Range {
+                from: Some(a + quarter),
+                until: Some(b - quarter),
+            });
+            self.selected = self.windows.len() - 1;
+            self.text_from_window();
+        }
+        if ui
+            .add_enabled(any, egui::Button::new("Whole log").small())
+            .on_hover_text("Forget the slices and convert everything")
+            .clicked()
+        {
+            self.windows.clear();
+            self.selected = 0;
+            self.text_from_window();
+        }
+    }
+
+    /// One chip per slice: which one is being edited, and a way to drop it.
+    fn slice_chips(&mut self, ui: &mut egui::Ui) {
+        let mut pick: Option<usize> = None;
+        let mut drop: Option<usize> = None;
+        let labels: Vec<String> = self
+            .windows
+            .iter()
+            .map(|w| {
+                let short = |t: Option<i64>| match t {
+                    // dd.mm HH:MM -- the year is on the axis above.
+                    Some(t) => {
+                        let s = convert::filetime_to_short(t);
+                        format!("{} {}", &s[..5], &s[11..16])
+                    }
+                    None => "open".into(),
+                };
+                format!("{} - {}", short(w.from), short(w.until))
+            })
+            .collect();
+
+        ui.horizontal_wrapped(|ui| {
+            for (i, label) in labels.iter().enumerate() {
+                if ui
+                    .selectable_label(i == self.selected, body(format!("{}. {label}", i + 1)))
+                    .clicked()
+                {
+                    pick = Some(i);
+                }
+                if cross(ui).on_hover_text("Drop this slice").clicked() {
+                    drop = Some(i);
+                }
+                ui.add_space(6.0);
+            }
+        });
+
+        if let Some(i) = pick {
+            self.selected = i;
+            self.text_from_window();
+        }
+        if let Some(i) = drop {
+            self.windows.remove(i);
+            self.selected = self.selected.min(self.windows.len().saturating_sub(1));
+            self.text_from_window();
+        }
+    }
+
+    /// How much of the log the slices keep, live.
+    fn kept_label(&mut self, ui: &mut egui::Ui) {
+        if self.value_dbs().is_empty() {
+            ui.label(muted("no files ticked"));
+            return;
+        }
+        if self.windows().map(|w| w.is_open()).unwrap_or(false) {
+            ui.label(muted("the whole log is converted"));
+            return;
+        }
+        let total: u64 = self
+            .included()
+            .filter(|s| s.probe.has_values)
+            .map(|s| s.probe.value_rows)
+            .sum();
+        match self.total_values() {
+            Some(0) => {
+                ui.label(body("nothing is left in here").color(BAD));
+            }
+            Some(kept) => {
+                ui.label(
+                    strong(format!("keeps {} of {}", sep(kept), sep(total))).color(OK),
+                );
+            }
+            None => {
+                ui.label(muted("counting..."));
+                ui.spinner();
+            }
+        }
     }
 
     /// Where the CSV files go and what they are called -- one line, because by
@@ -1636,31 +1871,37 @@ impl App {
     fn options_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_BOTTOM);
-            section(ui, "What to write", "");
-            ui.add_space(theme::GAP);
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.write_long, "Long table -- a row per value");
+            // All four choices on one line: they are short, and side by side
+            // they read as the one question they are.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(strong("What to write"));
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.write_long, "Long table")
+                    .on_hover_text("One row per logged value");
                 if self.write_long {
                     let chosen = self.columns().len();
                     if ui
-                        .small_button("Columns...")
+                        .small_button(format!("Columns... {chosen} of {}", Column::ALL.len()))
                         .on_hover_text("Choose which columns to write, and in what order")
                         .clicked()
                     {
                         self.columns_open = true;
                     }
-                    if chosen != Column::ALL.len() {
-                        ui.label(muted(format!("{chosen} of {}", Column::ALL.len())));
-                    }
                 }
-            });
-            ui.checkbox(&mut self.write_wide, "Wide table -- a column per tag");
-            ui.checkbox(&mut self.semicolon, "Separate with ;  (for Excel)");
-            ui.checkbox(&mut self.shorten_names, "Shorten tag names");
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.write_wide, "Wide table")
+                    .on_hover_text("One row per timestamp, one column per tag");
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.semicolon, "Separate with ;")
+                    .on_hover_text("For Excel where the comma is the decimal mark");
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.shorten_names, "Shorten tag names");
 
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            });
+
+            // The charts have their own line: they are a different question
+            // from what the CSV holds, and together the two wrap badly.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(muted("Chart detail"));
                 for d in [Detail::Light, Detail::Balanced, Detail::Full] {
                     let picked = self.detail == d;
@@ -1672,20 +1913,20 @@ impl App {
                         self.detail = d;
                     }
                 }
-            });
-
-            if self.shorten_names {
-                ui.add_space(4.0);
-                match self.shorten_example() {
-                    Some((full, short)) => {
-                        ui.label(muted(full));
-                        ui.label(muted(format!("becomes   {short}")).color(OK));
-                    }
-                    None => {
-                        ui.label(muted("Load the tag database to see an example."));
+                if self.shorten_names {
+                    ui.add_space(12.0);
+                    match self.shorten_example() {
+                        Some((full, short)) => {
+                            ui.label(muted(elide_end(&full, 44)));
+                            ui.label(muted("becomes"));
+                            ui.label(muted(short).color(OK));
+                        }
+                        None => {
+                            ui.label(muted("Tick a tag database to see an example."));
+                        }
                     }
                 }
-            }
+            });
         });
     }
 
@@ -1821,7 +2062,7 @@ impl App {
 
     fn convert_button(&mut self, ui: &mut egui::Ui) {
         let ready = self.ready();
-        let can_chart = !self.value_dbs().is_empty() && self.range().is_ok();
+        let can_chart = !self.value_dbs().is_empty() && self.windows().is_ok();
         let width = ui.available_width();
         let chart_width = 150.0_f32.min(width * 0.22);
         // The button says how much it is about to convert, so there is no need
@@ -2836,47 +3077,51 @@ fn kv(ui: &mut egui::Ui, key: &str, value: impl Into<String>) {
     });
 }
 
-/// One date/time input: the field, the remembered value as placeholder and as a
-/// button, and the exact instant it resolves to.
-fn range_field(ui: &mut egui::Ui, label: &str, text: &mut String, last: &str, end_of_day: bool) {
-    ui.horizontal(|ui| {
-        ui.add_sized([40.0, 18.0], egui::Label::new(body(label)));
+/// One date/time input: the field, the remembered value as a button, and a
+/// way to clear it. True when the user changed it.
+fn range_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    text: &mut String,
+    last: &str,
+    exact: String,
+) -> bool {
+    let mut edited = false;
+    ui.label(body(label));
 
-        let hint = if last.trim().is_empty() {
-            "18.09.2026 06:30".to_string()
-        } else {
-            last.trim().to_string()
-        };
-        ui.add(
+    let hint = if last.trim().is_empty() {
+        "18.09.2026 06:30".to_string()
+    } else {
+        last.trim().to_string()
+    };
+    edited |= ui
+        .add(
             egui::TextEdit::singleline(text)
                 .hint_text(hint)
-                .desired_width(146.0),
-        );
+                .desired_width(150.0),
+        )
+        .on_hover_text(format!(
+            "{exact}
 
-        if !last.trim().is_empty()
-            && text.trim() != last.trim()
-            && ui
-                .small_button("Use last")
-                .on_hover_text(format!("Paste what was used last time: {}", last.trim()))
-                .clicked()
-        {
-            *text = last.trim().to_string();
-        }
-        if !text.is_empty() && ui.small_button("Clear").clicked() {
-            text.clear();
-        }
-    });
+18.09.2026, 18.09.2026 06:30, 2026-09-18T06:30:45,123              or a raw pk_TimeStamp number"
+        ))
+        .changed();
 
-    // The instant it resolves to, on its own line so the row stays narrow.
-    if !text.trim().is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(44.0);
-            match convert::parse_when(text, end_of_day) {
-                Ok(t) => ui.label(muted(format!("= {}", convert::filetime_to_text(t)))),
-                Err(e) => ui.label(muted(e).color(BAD)),
-            };
-        });
+    if !last.trim().is_empty()
+        && text.trim() != last.trim()
+        && ui
+            .small_button("Use last")
+            .on_hover_text(format!("Paste what was used last time: {}", last.trim()))
+            .clicked()
+    {
+        *text = last.trim().to_string();
+        edited = true;
     }
+    if !text.is_empty() && cross(ui).on_hover_text("Clear").clicked() {
+        text.clear();
+        edited = true;
+    }
+    edited
 }
 
 // ---------------------------------------------------------------- helpers
