@@ -38,12 +38,11 @@ pub const BAD: Color32 = Color32::from_rgb(0xF2, 0x7B, 0x7B);
 // -- measurements -------------------------------------------------------
 
 /// The single vertical rhythm used between and inside cards.
-pub const GAP: f32 = 10.0;
+pub const GAP: f32 = 8.0;
 
-/// Minimum height of the cards in the upper and lower row, so that the two
-/// cards of a row end at the same line.
-pub const ROW_TOP: f32 = 124.0;
-pub const ROW_BOTTOM: f32 = 116.0;
+/// Minimum height of the two cards that sit side by side, so they end at the
+/// same line however much each has to say.
+pub const ROW_BOTTOM: f32 = 104.0;
 
 const RADIUS: u8 = 6;
 const SIZE_HEADING: f32 = 20.0;
@@ -175,11 +174,14 @@ pub fn card() -> egui::Frame {
         .fill(CARD)
         .stroke(Stroke::new(1.0, EDGE))
         .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin::same(12))
+        .inner_margin(egui::Margin::same(10))
 }
 
 /// The drop target, which lights up while a file is over the window.
-pub fn drop_card(hovering: bool) -> egui::Frame {
+///
+/// `tall` is the empty state, which is worth the room because it is the one
+/// instruction the program has; once files are loaded it shrinks to a bar.
+pub fn drop_card(hovering: bool, tall: bool) -> egui::Frame {
     let (fill, stroke) = if hovering {
         (ACCENT_FILL.gamma_multiply(0.30), Stroke::new(2.0, ACCENT))
     } else {
@@ -189,7 +191,7 @@ pub fn drop_card(hovering: bool) -> egui::Frame {
         .fill(fill)
         .stroke(stroke)
         .corner_radius(CornerRadius::same(RADIUS))
-        .inner_margin(egui::Margin::symmetric(12, 14))
+        .inner_margin(egui::Margin::symmetric(10, if tall { 12 } else { 5 }))
 }
 
 /// A small coloured tag, for what a file holds. Drawn rather than written, so

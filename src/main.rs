@@ -43,8 +43,8 @@ fn main() -> eframe::Result {
     let preload: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([880.0, 690.0])
-        .with_min_inner_size([560.0, 520.0])
+        .with_inner_size([960.0, 760.0])
+        .with_min_inner_size([620.0, 560.0])
         .with_drag_and_drop(true)
         .with_title("HMI Log Converter");
 
@@ -1224,7 +1224,7 @@ impl App {
     fn drop_zone(&mut self, ui: &mut egui::Ui, hovering: bool) {
         let empty = self.sources.is_empty();
         let mut picked: Option<Vec<PathBuf>> = None;
-        theme::drop_card(hovering).show(ui, |ui| {
+        theme::drop_card(hovering, empty || hovering).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if empty || hovering {
                 ui.vertical_centered(|ui| {
@@ -1278,7 +1278,6 @@ impl App {
     fn sources_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_TOP);
             self.table_head(ui);
             if self.sources.is_empty() {
                 ui.add_space(theme::GAP);
@@ -1382,12 +1381,13 @@ impl App {
             })
             .collect();
 
-        let height = (shown.len().max(1) as f32 * (ROW_H + 3.0)).min(TABLE_MAX_H);
         let mut act: Option<RowAct> = None;
         egui::ScrollArea::vertical()
             .id_salt("sources")
-            .max_height(height)
-            .auto_shrink([false, false])
+            // Only as tall as the rows need, until there are enough of them to
+            // push the rest of the window out of sight.
+            .max_height(TABLE_MAX_H)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 if shown.is_empty() {
                     ui.label(muted("No file matches the filter."));
@@ -1576,43 +1576,36 @@ impl App {
         });
     }
 
-    /// Where the CSV files go and what they are called.
+    /// Where the CSV files go and what they are called -- one line, because by
+    /// this point the interesting decisions have been made above.
     fn output_view(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(theme::ROW_BOTTOM);
-            section(ui, "Save to", "");
-            ui.add_space(theme::GAP);
-
             ui.horizontal(|ui| {
-                ui.label(body("Name"));
+                ui.label(strong("Save to"));
                 let mut name = self.base_name();
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut name)
-                            .desired_width(150.0)
+                            .desired_width(170.0)
                             .hint_text("file name"),
                     )
+                    .on_hover_text("The part before _long.csv and _wide.csv")
                     .changed()
                 {
                     self.base_name = Some(name);
                 }
                 if ui
-                    .button("Browse...")
+                    .small_button("Browse...")
                     .on_hover_text("Pick the folder and the name in Explorer")
                     .clicked()
                 {
                     self.browse_output();
                 }
-            });
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(muted("Folder"));
                 match self.chosen_dir() {
                     Some(dir) => {
                         if ui
-                            .link(muted(elide(&dir.display().to_string(), 38)))
+                            .link(muted(elide(&dir.display().to_string(), 34)))
                             .on_hover_text(format!(
                                 "{}\n\nClick to open in Explorer",
                                 dir.display()
@@ -1623,16 +1616,19 @@ impl App {
                         }
                     }
                     None => {
-                        ui.label(muted("beside the value database, once it is loaded"));
+                        ui.label(muted("beside the first database, once one is loaded"));
                     }
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let files = self.output_files();
+                    if files.is_empty() {
+                        ui.label(body("Pick at least one table.").color(WARN));
+                    } else {
+                        ui.label(muted(format!("writes  {}", files.join("   "))));
+                    }
+                });
             });
-            for f in self.output_files() {
-                ui.label(muted(format!("writes  {f}")));
-            }
-            if self.output_files().is_empty() {
-                ui.label(body("Pick at least one table below.").color(WARN));
-            }
         });
     }
 
@@ -1963,9 +1959,15 @@ impl App {
 
         ui.label(theme::heading("Finished").color(OK));
         ui.label(muted(format!(
-            "{} values from {} tags in {:.1} s",
+            "{} values from {} tags out of {} {} in {:.1} s",
             sep(s.rows),
             s.tags_used,
+            s.sources.len(),
+            if s.sources.len() == 1 {
+                "database"
+            } else {
+                "databases"
+            },
             s.secs
         )));
         ui.add_space(theme::GAP);
@@ -1998,6 +2000,34 @@ impl App {
                 });
             }
         });
+
+        if s.sources.len() > 1 {
+            ui.add_space(theme::GAP);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                section(ui, "Imported from", "");
+                ui.add_space(6.0);
+                for (path, rows) in &s.sources {
+                    ui.horizontal(|ui| {
+                        dot(ui, if *rows > 0 { OK } else { DIM });
+                        ui.add_sized(
+                            [110.0, 18.0],
+                            egui::Label::new(body(sep(*rows))).halign(egui::Align::RIGHT),
+                        );
+                        if ui
+                            .link(muted(file_name(path)))
+                            .on_hover_text(format!(
+                                "{}\n\nClick to show in Explorer",
+                                path.display()
+                            ))
+                            .clicked()
+                        {
+                            reveal(path);
+                        }
+                    });
+                }
+            });
+        }
 
         ui.add_space(theme::GAP);
         theme::card().show(ui, |ui| {
@@ -2252,10 +2282,11 @@ impl App {
 // ---------------------------------------------------------------- file table
 
 /// Height of one row of the file table.
-const FILE_ROW: f32 = 28.0;
-/// The table starts scrolling at this height, so the cards below it stay put
-/// whether three files were dropped or three hundred.
-const TABLE_MAX_H: f32 = 236.0;
+const FILE_ROW: f32 = 25.0;
+/// The table starts scrolling only past this height -- about ten files -- so
+/// that the usual handful never has a scrollbar, and three hundred do not push
+/// the rest of the window out of sight.
+const TABLE_MAX_H: f32 = 268.0;
 
 /// What a click on one row of the file table asked for.
 enum RowAct {
