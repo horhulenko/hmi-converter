@@ -91,7 +91,7 @@ pub fn parse_when(text: &str, end_of_day: bool) -> Result<i64, String> {
     if s.chars().all(|c| c.is_ascii_digit()) {
         return match s.parse::<i64>() {
             Ok(n) if n >= 0 => Ok(n),
-            _ => Err("that number is not a timestamp".into()),
+            _ => Err("diese Zahl ist kein Zeitstempel".into()),
         };
     }
 
@@ -111,14 +111,14 @@ pub fn parse_when(text: &str, end_of_day: bool) -> Result<i64, String> {
             .map(|p| p.trim().parse::<i64>())
             .collect()
     };
-    let nums = nums.map_err(|_| "date should look like 2026-09-18".to_string())?;
+    let nums = nums.map_err(|_| "Datum bitte als 18.09.2026 schreiben".to_string())?;
     let (y, mo, d) = match (nums.len(), date_part.contains('.')) {
         (3, false) => (nums[0], nums[1], nums[2]),
         (3, true) => (nums[2], nums[1], nums[0]), // 18.09.2026
-        _ => return Err("date should look like 2026-09-18 or 18.09.2026".into()),
+        _ => return Err("Datum bitte als 18.09.2026 oder 2026-09-18 schreiben".into()),
     };
     if !(1601..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return Err("that is not a real date".into());
+        return Err("dieses Datum gibt es nicht".into());
     }
 
     let mut ticks = (days_from_civil(y, mo, d) * 86_400 + FILETIME_EPOCH_DIFF_SECS) * TICKS_PER_SEC;
@@ -135,20 +135,20 @@ pub fn parse_when(text: &str, end_of_day: bool) -> Result<i64, String> {
         None => (time_part, ""),
     };
     let parts: Result<Vec<i64>, _> = hms.split(':').map(|p| p.trim().parse::<i64>()).collect();
-    let parts = parts.map_err(|_| "time should look like 06:30 or 06:30:45".to_string())?;
+    let parts = parts.map_err(|_| "Uhrzeit bitte als 06:30 oder 06:30:45 schreiben".to_string())?;
     let (h, mi, sec) = match parts.len() {
         2 => (parts[0], parts[1], 0),
         3 => (parts[0], parts[1], parts[2]),
-        _ => return Err("time should look like 06:30 or 06:30:45".into()),
+        _ => return Err("Uhrzeit bitte als 06:30 oder 06:30:45 schreiben".into()),
     };
     if h > 23 || mi > 59 || sec > 59 || h < 0 || mi < 0 || sec < 0 {
-        return Err("that is not a real time".into());
+        return Err("diese Uhrzeit gibt es nicht".into());
     }
     ticks += ((h * 3600) + (mi * 60) + sec) * TICKS_PER_SEC;
 
     if !frac.is_empty() {
         if !frac.chars().all(|c| c.is_ascii_digit()) {
-            return Err("fractional seconds must be digits".into());
+            return Err("Sekundenbruchteile bitte nur als Ziffern".into());
         }
         let mut digits = frac.to_string();
         digits.truncate(7);
@@ -349,10 +349,10 @@ pub fn open_readonly(path: &Path) -> Result<Connection, String> {
 
     // Last resort: work on a copy, so a database still in use by the HMI converts too.
     let scratch = std::env::temp_dir().join("hmi-converter-scratch");
-    fs::create_dir_all(&scratch).map_err(|e| format!("cannot create temp folder: {e}"))?;
+    fs::create_dir_all(&scratch).map_err(|e| format!("Temporärer Ordner kann nicht angelegt werden: {e}"))?;
     let name = path.file_name().unwrap_or_default().to_os_string();
     let copy = scratch.join(&name);
-    fs::copy(path, &copy).map_err(|e| format!("cannot read this file: {e}"))?;
+    fs::copy(path, &copy).map_err(|e| format!("Datei kann nicht gelesen werden: {e}"))?;
     for suffix in ["-wal", "-shm"] {
         let sibling = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
         if sibling.exists() {
@@ -360,7 +360,7 @@ pub fn open_readonly(path: &Path) -> Result<Connection, String> {
             let _ = fs::copy(&sibling, target);
         }
     }
-    let c = Connection::open(&copy).map_err(|e| format!("cannot open database: {e}"))?;
+    let c = Connection::open(&copy).map_err(|e| format!("Datenbank kann nicht geöffnet werden: {e}"))?;
     tune(&c);
     Ok(c)
 }
@@ -372,7 +372,7 @@ fn tune(c: &Connection) {
 pub fn table_names(conn: &Connection) -> Result<BTreeSet<String>, String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .map_err(|e| format!("not a readable SQLite database: {e}"))?;
+        .map_err(|e| format!("keine lesbare SQLite-Datenbank: {e}"))?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
@@ -517,9 +517,9 @@ impl Probe {
     /// What this file can be used for, for the table in the window.
     pub fn role(&self) -> &'static str {
         match (self.has_tags, self.has_values) {
-            (true, true) => "Tags + values",
-            (true, false) => "Tag names",
-            _ => "Logged values",
+            (true, true) => "Tags + Werte",
+            (true, false) => "Tag-Namen",
+            _ => "Messwerte",
         }
     }
 }
@@ -533,7 +533,7 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
 
     if !has_tags && !has_values {
         return Err(format!(
-            "no HMI logging tables inside (looked for {TAG_TABLE} and {MAIN_VALUE_TABLE})"
+            "keine HMI-Protokolltabellen ({TAG_TABLE} oder {MAIN_VALUE_TABLE}) enthalten"
         ));
     }
 
@@ -742,7 +742,7 @@ pub fn count_kept(values_db: &Path, windows: &Windows) -> Result<Kept, String> {
         .filter(|t| present.contains(*t))
         .collect();
     if used.is_empty() {
-        return Err(format!("no {MAIN_VALUE_TABLE} table"));
+        return Err(format!("keine Tabelle {MAIN_VALUE_TABLE}"));
     }
 
     let total_rows: u64 = used.iter().map(|t| count(&conn, t)).sum();
@@ -837,13 +837,13 @@ impl Column {
     /// What it holds, in words, for the chooser.
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Time => "the time, as 18.09.2026 06:03:48.7883740",
-            Self::TimeRaw => "the untouched number from the database",
-            Self::Id => "tag number",
-            Self::Value => "the logged value",
-            Self::Name => "tag name",
-            Self::Quality => "192 is good, anything else doubtful",
-            Self::File => "the database file the row came from",
+            Self::Time => "Zeit, als 18.09.2026 06:03:48.7883740",
+            Self::TimeRaw => "die unveränderte Zahl aus der Datenbank",
+            Self::Id => "Tag-Nummer",
+            Self::Value => "der protokollierte Wert",
+            Self::Name => "Tag-Name",
+            Self::Quality => "192 ist gut, alles andere zweifelhaft",
+            Self::File => "die Datenbank, aus der die Zeile stammt",
         }
     }
 
@@ -1067,7 +1067,7 @@ fn read_one(
         .filter(|t| present.contains(*t))
         .collect();
     if used.is_empty() {
-        return Err(format!("holds no {MAIN_VALUE_TABLE} table"));
+        return Err(format!("enthält keine Tabelle {MAIN_VALUE_TABLE}"));
     }
 
     let where_sql = windows.where_sql();
@@ -1194,11 +1194,11 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     };
 
     if job.value_dbs.is_empty() {
-        return Err("no database with logged values was chosen".into());
+        return Err("Keine Datenbank mit Messwerten ausgewählt".into());
     }
 
     // -- 1. tag names ------------------------------------------------------
-    say("Reading tag names");
+    say("Tag-Namen lesen");
     let listed = read_all_tag_names(&job.tag_dbs)?;
     let tags_total = listed.len();
     let names: HashMap<i64, String> = if job.shorten_names {
@@ -1209,12 +1209,12 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
 
     // -- 2. find out what the chosen databases actually hold ----------------
     say(&format!(
-        "Scanning {} {}",
+        "{} {} durchsuchen",
         job.value_dbs.len(),
         if job.value_dbs.len() == 1 {
-            "database"
+            "Datenbank"
         } else {
-            "databases"
+            "Datenbanken"
         }
     ));
     // Every tag id that really occurs in the window, across all the files:
@@ -1231,9 +1231,9 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     }
     if total == 0 {
         return Err(if job.windows.is_open() {
-            "the chosen databases contain no logged values".into()
+            "Die gewählten Datenbanken enthalten keine Messwerte".into()
         } else {
-            "no logged values fall inside the chosen time range".to_string()
+            "Im gewählten Zeitraum liegen keine Messwerte".to_string()
         });
     }
     let ids: Vec<i64> = id_set.into_iter().collect();
@@ -1251,23 +1251,23 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     };
 
     // -- 3. output files ---------------------------------------------------
-    fs::create_dir_all(&job.out_dir).map_err(|e| format!("cannot create output folder: {e}"))?;
+    fs::create_dir_all(&job.out_dir).map_err(|e| format!("Ausgabeordner kann nicht angelegt werden: {e}"))?;
     let long_path = job.out_dir.join(format!("{}_long.csv", job.base_name));
     let wide_path = job.out_dir.join(format!("{}_wide.csv", job.base_name));
 
     if job.write_long && job.columns.is_empty() {
-        return Err("the long table needs at least one column".into());
+        return Err("Die lange Tabelle braucht mindestens eine Spalte".into());
     }
     let mut long = if job.write_long {
         let f = fs::File::create(&long_path)
-            .map_err(|e| format!("cannot write {}: {e}", long_path.display()))?;
+            .map_err(|e| format!("{} kann nicht geschrieben werden: {e}", long_path.display()))?;
         Some(BufWriter::with_capacity(1 << 20, f))
     } else {
         None
     };
     let mut wide = if job.write_wide {
         let f = fs::File::create(&wide_path)
-            .map_err(|e| format!("cannot write {}: {e}", wide_path.display()))?;
+            .map_err(|e| format!("{} kann nicht geschrieben werden: {e}", wide_path.display()))?;
         Some(BufWriter::with_capacity(1 << 20, f))
     } else {
         None
@@ -1299,7 +1299,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
     }
 
     // -- 4. one sorted pass over every chosen database ----------------------
-    say("Converting");
+    say("Umwandeln");
     let source_names: Vec<String> = job.value_dbs.iter().map(|p| short_name(p)).collect();
     let mut from_file: Vec<u64> = vec![0; job.value_dbs.len()];
     let mut stream = ValueStream::open(&job.value_dbs, &job.windows, cancel);
@@ -1392,7 +1392,7 @@ pub fn run(job: &Job, tx: &Sender<Progress>, cancel: &Arc<AtomicBool>) -> Result
         timestamps += 1;
     }
 
-    say("Writing files to disk");
+    say("Dateien schreiben");
     let mut files = Vec::new();
     if let Some(mut w) = long {
         w.flush().map_err(|e| e.to_string())?;
