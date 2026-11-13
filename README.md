@@ -37,39 +37,43 @@ matters.
 
 ## Using the window
 
-1. Drag the `.db3` files onto the window, or their whole folder (or press
-   **Choose files…** / **Choose a folder…**).
-2. Look over **Files to import** and untick anything you do not want.
-3. Optionally take a slice out of the log under **Time range**.
-4. Check the name under **Save to** and what to write under **What to write**.
-5. Press **Convert to CSV**.
+The window is in German and walks through three numbered steps, top to
+bottom; the bar along the bottom says what pressing the button will produce.
 
-### Files to import
+1. **Dateien laden** — drag the `.db3` files onto the window, or their whole
+   folder (or press **Dateien wählen …** / **Ordner wählen …**), and untick
+   anything you do not want.
+2. **Zeitraum wählen** — optionally take a slice out of the log.
+3. **Ausgabe festlegen** — which tables, their format, the name and folder.
+
+Then press **In CSV umwandeln**.
+
+### Dateien laden
 
 One row per database found, in the order they are read:
 
 | column | |
 | --- | --- |
 | tick | whether the file takes part in this import |
-| Holds | `tag names`, `values`, or both |
-| File | its name; click it to show the file in Explorer |
-| Values | how many of its values the import will write |
-| Logged from | when it starts, and how long it covers |
-| Size | the file on disk |
+| Datei | its name; click it to show the file in Explorer |
+| Inhalt | `Tag-Namen`, `Werte`, or both |
+| Werte | how many of its values the import will write |
+| Zeitraum | when it starts, and how long it covers |
 
 Including and excluding is meant to be quick:
 
 * a **tick**, or a click anywhere on the row
 * **shift**-click to carry that on to every row back to the last one ticked
 * **right-click** for that file and no other
-* **All**, **None**, **Invert**, and a filter box once the list is long
+* the tick in the heading for all or none, and a filter box once the list is long
 * the **✕** at the end of a row takes the file off the list altogether
 
-Underneath, the totals say what the import adds up to. They also warn when no
+The foot of the list says how many files are chosen and what period they cover,
+and holds **+ Dateien**, **+ Ordner** and **Leeren**. A banner warns when no
 tag database is in (tags are then written as `id_<number>`) and when two files
 cover the same period, which would write those readings twice.
 
-### Time range
+### Zeitraum wählen
 
 The files are drawn on one axis, each as a bar where it logs — **bright where
 it really logged, faint where it did not**, so a night the plant stood still is
@@ -78,20 +82,32 @@ visible before converting rather than after.
 * **drag across the bar** to take a slice
 * **drag its edges** to adjust it, or the middle to move it; the edges snap to
   the ends of the files
-* **Split** cuts a slice in two so the halves can be pulled apart, which leaves
-  the quiet hour between them out of the export. Any number of slices is
-  allowed, and **Whole log** forgets them again.
-* the **From** and **Until** fields say exactly where the chosen slice falls,
+* **Teilen** cuts a slice in two so the halves can be pulled apart, which
+  leaves the quiet hour between them out of the export. Any number of slices
+  is allowed, and **Alles** forgets them again.
+* the **Von** and **Bis** fields say exactly where the chosen slice falls,
   and can be typed into instead
 
-While you drag, the count of what survives follows along, file by file.
+Editing slices is forgiving on purpose:
 
-The last range you converted is remembered: it appears as the grey placeholder
-in the fields, and the **Use last** button fills it in again.
+* an edge can be taken from well beside it, and a press on bare track near a
+  slice reaches for the nearest edge of that slice instead of starting a
+  second one — a new slice is only drawn clearly away from the others
+* the handle that a press would take lights up before pressing
+* dragging an edge past the other one turns the slice round
+* slices pushed into each other become one, and a stray click leaves nothing
+* **Esc** while dragging puts everything back; **Strg+Z** or **Rückgängig**
+  steps back through every change
+
+While you drag, the share and count of what survives follow along beside the
+title, and file by file in the list above.
+
+The last range you converted is remembered, and **Wie zuletzt** fills it in
+again.
 
 ## Output
 
-Two files, named after the box under **Save to**:
+Two files, named after the box under **Speichern als**:
 
 **`<name>_long.csv`** — one row per logged value, which is the shape most tools
 want for filtering and grouping:
@@ -111,7 +127,7 @@ and for Excel. An empty cell means that tag logged nothing at that instant.
 
 ### Choosing the long table's columns
 
-The **Columns...** button beside *Long table* opens a chooser where you can
+The **Spalten …** button beside *Lang* opens a chooser where you can
 
 * untick any column you do not want,
 * drag a row by its handle into any order (the others slide out of the way),
@@ -189,8 +205,8 @@ The window shows a real example from your own file as soon as you tick the box.
 
 ## Charts
 
-**Open charts** builds one HTML page beside the CSV files and hands it to your
-browser. Everything is inside that page: the Apache ECharts library is compiled
+**Im Browser** builds one HTML page beside the CSV files and hands it to your
+browser (**Diagramm** draws the same values inside the window instead). Everything is inside that page: the Apache ECharts library is compiled
 into the program and copied in, so the chart works with no network, no install
 and no server - and the file can be sent to someone else as it is.
 
@@ -198,38 +214,41 @@ Eleven ways to look at the same values, switched with one click:
 
 | | |
 | --- | --- |
-| Lines, Area, Stacked, Steps, Scatter, Bars | the value against time |
-| Small multiples | one little chart per tag, to skim a hundred tags at once |
+| Linien, Fläche, Gestapelt, Stufen, Punkte, Balken | the value against time |
+| Einzeln | one little chart per tag, to skim a hundred tags at once |
 | Heatmap | time across, tags down, colour for the value |
-| Histogram | how often each value occurs |
-| Box plot | median, quartiles and reach, tag beside tag |
-| Correlation | one tag against another, coloured by time |
+| Histogramm | how often each value occurs |
+| Boxplot | median, quartiles and reach, tag beside tag |
+| Korrelation | one tag against another, coloured by time |
 
 Hovering anywhere on a time chart lists **every chosen tag with its name and its
-value at that instant**, largest first. Tags do not log in step with each other,
-so a reading that still stands is marked `held` rather than invented.
+value at that instant**, largest first. The crosshair sits exactly under the
+pointer rather than jumping to a data point, and the values are looked up by
+time, so it keeps up however many points there are. Tags do not log in step
+with each other, so a reading that still stands is marked `gehalten` rather
+than invented. Numbers are written the German way — `0,009`, never `9e-3`.
 
 The list on the left switches tags in and out as you watch, with a filter box
-and All / None / Invert. **Log scale** covers values spanning orders of
-magnitude; **Normalise** puts everything on 0-100% when the units differ.
+and Alle / Keine / Umkehren. **Logarithmisch** covers values spanning orders of
+magnitude; **Normiert** puts everything on 0–100 % when the units differ.
 Drag on the chart to zoom, or use the slider underneath.
 
 Only the eight busiest tags are on at the start, so the first view is readable.
 
 ### Detail
 
-The whole log is more points than a browser enjoys, so **Chart detail** decides
-how many of them go into the page:
+The whole log is more points than a browser enjoys, so **Diagramm-Detail**
+decides how many of them go into the page:
 
 | | |
 | --- | --- |
-| Light | up to 1000 points per tag |
-| Balanced (default) | up to 4000 points per tag |
-| Full | every point, largest file |
+| Leicht | up to 1000 points per tag |
+| Ausgewogen (default) | up to 4000 points per tag |
+| Voll | every point, largest file |
 
 Thinning uses *largest-triangle-three-buckets*, which keeps the shape of the
 line and its peaks rather than averaging them away. The sample export at
-Balanced is 83 000 of 602 922 points and makes a 3.4 MB page.
+Ausgewogen is 83 000 of 602 922 points and makes a 3.4 MB page.
 
 Tags that log text rather than numbers cannot go on an axis; they are left out
 and counted on the finished screen.
@@ -276,6 +295,9 @@ slices turn into, the tag-name shortening (including the cases that must not
 merge) and CSV quoting.
 
 ## Credits
+
+The window and the chart page are set in Noto Sans (SIL Open Font License,
+`assets/fonts/OFL.txt`), cut down to the Latin letters and compiled in.
 
 Charts are drawn by Apache ECharts (Apache-2.0), a copy of which lives in
 `assets/echarts.min.js` and is compiled into the program, so the pages it
