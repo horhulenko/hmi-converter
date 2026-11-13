@@ -1,6 +1,12 @@
-[English](README.md) · **Deutsch**
+[English](README.md) · **Deutsch** · [Русский](README.ru.md)
 
 # HMI Log Converter
+
+[![Version](https://img.shields.io/github/v/release/horhulenko/hmi-converter?label=Version&color=0B8DDC)](../../releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/horhulenko/hmi-converter/total?label=Downloads&color=0B8DDC)](../../releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/horhulenko/hmi-converter/release.yml?label=Build)](../../actions/workflows/release.yml)
+[![Lizenz](https://img.shields.io/github/license/horhulenko/hmi-converter?label=Lizenz&color=0B8DDC)](LICENSE)
+![Plattform](https://img.shields.io/badge/Plattform-Windows%20%7C%20Linux-0B8DDC)
 
 Wandelt die Protokolldateien eines WinCC-HMI-Panels in CSV um.
 Zeigt die Werte in einem Diagramm.

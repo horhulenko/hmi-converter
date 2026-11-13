@@ -1,6 +1,12 @@
-**English** · [Deutsch](README.de.md)
+**English** · [Deutsch](README.de.md) · [Русский](README.ru.md)
 
 # HMI Log Converter
+
+[![Release](https://img.shields.io/github/v/release/horhulenko/hmi-converter?label=release&color=0B8DDC)](../../releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/horhulenko/hmi-converter/total?label=downloads&color=0B8DDC)](../../releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/horhulenko/hmi-converter/release.yml?label=build)](../../actions/workflows/release.yml)
+[![License](https://img.shields.io/github/license/horhulenko/hmi-converter?label=license&color=0B8DDC)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0B8DDC)
 
 Convert the log files of a WinCC HMI panel to CSV.
 See the values in a chart.
