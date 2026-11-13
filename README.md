@@ -62,3 +62,17 @@ MIT — see [LICENSE](LICENSE).
 
 The charts use [Apache ECharts](https://echarts.apache.org) (Apache 2.0).
 The font is Noto Sans (SIL Open Font License).
+
+## Search words
+
+This program helps when:
+
+- TIA Portal or WinCC Unified exports only one `.db3` log file to CSV at a time.
+- The HMI writes a new log file every few hours, and you need all of them in one table.
+- You want the values of a tag logging (data log) in Excel.
+
+Keywords: Siemens, TIA Portal, WinCC Unified, Unified Comfort Panel, HMI, SCADA,
+tag logging, data logging, data log, log database, `.db3`, SQLite,
+`LoggedProcessValue`, `LoggingTag`, merge log files, CSV export, Excel.
+
+This project is not made by Siemens and is not connected to Siemens.

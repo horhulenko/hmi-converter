@@ -62,3 +62,18 @@ MIT — siehe [LICENSE](LICENSE).
 
 Die Diagramme nutzen [Apache ECharts](https://echarts.apache.org) (Apache 2.0).
 Die Schrift ist Noto Sans (SIL Open Font License).
+
+## Suchbegriffe
+
+Dieses Programm hilft, wenn:
+
+- TIA Portal oder WinCC Unified nur eine `.db3`-Protokolldatei auf einmal als CSV exportiert.
+- Das HMI alle paar Stunden eine neue Protokolldatei schreibt und Sie alle in einer Tabelle brauchen.
+- Sie die Werte eines Variablenarchivs (Datenprotokoll) in Excel öffnen wollen.
+
+Stichworte: Siemens, TIA Portal, WinCC Unified, Unified Comfort Panel, HMI, SCADA,
+Variablenarchiv, Archivvariable, Datenprotokollierung, Protokolldatenbank, `.db3`,
+SQLite, `LoggedProcessValue`, `LoggingTag`, Protokolldateien zusammenführen,
+CSV-Export, Excel.
+
+Dieses Projekt ist nicht von Siemens und hat keine Verbindung zu Siemens.
