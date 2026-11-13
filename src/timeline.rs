@@ -12,7 +12,7 @@
 use eframe::egui;
 
 use crate::convert::{self, Range};
-use crate::theme::{self, ACCENT, DIM, EDGE, MUTED, OK, TEXT};
+use crate::theme::{self, ACCENT, ACCENT_DEEP, DIM, EDGE, MUTED, SURFACE, TEXT};
 
 /// One file, where it logs, and whether it is ticked in the table above.
 pub struct Lane {
@@ -35,15 +35,22 @@ pub enum Grab {
     New(usize, i64),
 }
 
-/// How much room the drawing needs, not counting the labels above it.
-const AXIS_H: f32 = 16.0;
-const LANE_H: f32 = 9.0;
-const LANE_GAP: f32 = 3.0;
+/// Room for the time labels above the bars.
+const AXIS_H: f32 = 24.0;
+/// The height the bars share between them, and the limits on one bar.
+const LANES_H: f32 = 96.0;
+const LANE_MIN: f32 = 14.0;
+const LANE_MAX: f32 = 30.0;
+const LANE_GAP: f32 = 4.0;
+/// Inside the track, above the first bar and below the last.
+const TRACK_PAD: f32 = 8.0;
 /// How many lanes are drawn one above the other before they are stacked into
-/// a single band -- past this the bars would be hairlines.
-const MAX_LANES: usize = 6;
+/// a single band -- past this the bars would be too thin to read.
+const MAX_LANES: usize = 7;
+/// The height of that single band.
+const STACKED_H: f32 = 56.0;
 /// How close the pointer has to be to an edge to take hold of it.
-const GRIP: f32 = 5.0;
+const GRIP: f32 = 7.0;
 /// 100-nanosecond ticks in a second, as everywhere else in the program.
 const SECOND: i64 = 10_000_000;
 
@@ -61,12 +68,21 @@ pub fn ui(
 ) -> bool {
     // Past a handful of files the bars would be hairlines, so they are all
     // drawn into one band -- and then only one row is needed.
-    let lane_rows = if lanes.len() > MAX_LANES {
-        1
+    let stacked = lanes.len() > MAX_LANES;
+    let rows = lanes.len().max(1);
+    let lane_h = if stacked {
+        STACKED_H
     } else {
-        lanes.len().max(1)
+        (LANES_H / rows as f32 - LANE_GAP).clamp(LANE_MIN, LANE_MAX)
     };
-    let height = AXIS_H + lane_rows as f32 * (LANE_H + LANE_GAP) + 6.0;
+    let lanes_h = if stacked {
+        STACKED_H
+    } else {
+        rows as f32 * (lane_h + LANE_GAP) - LANE_GAP
+    };
+    // Never shorter than a comfortable target, however few files there are.
+    let track_h = (lanes_h + TRACK_PAD * 2.0).max(LANES_H * 0.75);
+    let height = AXIS_H + track_h;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click_and_drag(),
@@ -76,19 +92,16 @@ pub fn ui(
     // Nothing loaded yet: one empty box the size of the whole picture, so the
     // card is the same height before and after the first file arrives.
     let Some((t0, t1)) = bounds.filter(|(a, b)| b > a) else {
-        let empty = rect.shrink2(egui::vec2(0.0, 2.0));
-        paint.rect(
-            empty,
-            egui::CornerRadius::same(4),
-            theme::FIELD.gamma_multiply(0.5),
-            egui::Stroke::new(1.0, EDGE),
-            egui::StrokeKind::Inside,
+        let empty = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + AXIS_H),
+            rect.max,
         );
+        paint.rect_filled(empty, egui::CornerRadius::same(8), SURFACE);
         paint.text(
             empty.center(),
             egui::Align2::CENTER_CENTER,
-            "the log appears here once a file is loaded",
-            egui::FontId::proportional(12.0),
+            "Hier erscheint der Verlauf, sobald Dateien geladen sind",
+            egui::FontId::proportional(13.0),
             DIM,
         );
         return false;
@@ -102,30 +115,26 @@ pub fn ui(
     let x_of = |t: i64| rect.left() + ((t - lo) as f64 / span) as f32 * rect.width();
     let t_of = |x: f32| lo + (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * span) as i64;
 
-    hours(&paint, rect, lo, hi, &x_of);
-
     // -- the files ---------------------------------------------------------
-    let band = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.top() + AXIS_H),
-        egui::pos2(rect.right(), rect.bottom() - 6.0),
-    );
-    paint.rect_filled(band, egui::CornerRadius::same(4), theme::FIELD);
-    let stacked = lanes.len() > MAX_LANES;
+    let band = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + AXIS_H), rect.max);
+    paint.rect_filled(band, egui::CornerRadius::same(8), SURFACE);
+    hours(&paint, rect, band, lo, hi, &x_of);
+    let first_top = band.center().y - lanes_h / 2.0;
     let mut under_pointer: Option<&Lane> = None;
     for (i, lane) in lanes.iter().enumerate() {
         let row = if stacked { 0 } else { i };
-        let top = band.top() + 2.0 + row as f32 * (LANE_H + LANE_GAP);
+        let top = first_top + row as f32 * (lane_h + LANE_GAP);
         let bar = egui::Rect::from_min_max(
             egui::pos2(x_of(lane.span.0), top),
-            egui::pos2(x_of(lane.span.1).max(x_of(lane.span.0) + 2.0), top + LANE_H),
+            egui::pos2(x_of(lane.span.1).max(x_of(lane.span.0) + 2.0), top + lane_h),
         );
         let color = if lane.on {
-            OK.gamma_multiply(if stacked { 0.6 } else { 1.0 })
+            ACCENT.gamma_multiply(if stacked { 0.7 } else { 1.0 })
         } else {
             DIM
         };
         // The file covers all of this...
-        paint.rect_filled(bar, egui::CornerRadius::same(2), color.gamma_multiply(0.18));
+        paint.rect_filled(bar, egui::CornerRadius::same(3), color.gamma_multiply(0.16));
         // ...but only logged where it is bright. A plant that stands still
         // overnight leaves a gap, and a slice taken over the gap is empty.
         if !lane.density.is_empty() {
@@ -138,19 +147,19 @@ pub fn ui(
                 }
                 let x = bar.left() + bar.width() * k as f32 / parts as f32;
                 // The square root keeps a quiet hour visible beside a busy one.
-                let strength = (*n as f32 / busiest).sqrt().clamp(0.25, 1.0);
+                let strength = (*n as f32 / busiest).sqrt().clamp(0.3, 1.0);
                 paint.rect_filled(
                     egui::Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(wide, bar.height())),
                     egui::CornerRadius::ZERO,
-                    color.gamma_multiply(strength * if stacked { 0.6 } else { 0.95 }),
+                    color.gamma_multiply(strength * if stacked { 0.7 } else { 1.0 }),
                 );
             }
         } else {
-            paint.rect_filled(bar, egui::CornerRadius::same(2), color.gamma_multiply(0.8));
+            paint.rect_filled(bar, egui::CornerRadius::same(3), color.gamma_multiply(0.8));
         }
         // Which file is which, on hover -- there is no room to write it.
         if let Some(p) = response.hover_pos()
-            && bar.expand2(egui::vec2(0.0, 1.5)).contains(p)
+            && bar.expand2(egui::vec2(0.0, LANE_GAP / 2.0)).contains(p)
             && under_pointer.is_none()
         {
             under_pointer = Some(lane);
@@ -158,9 +167,9 @@ pub fn ui(
     }
     if let Some(lane) = under_pointer {
         response.clone().show_tooltip_ui(|ui| {
-            ui.label(theme::body(lane.name.clone()));
+            ui.label(theme::strong(lane.name.clone()));
             ui.label(theme::muted(format!(
-                "{}  to  {}",
+                "{} – {}",
                 convert::filetime_to_short(lane.span.0),
                 convert::filetime_to_short(lane.span.1)
             )));
@@ -168,7 +177,7 @@ pub fn ui(
     }
 
     // -- what is left out --------------------------------------------------
-    let shade = egui::Color32::from_black_alpha(130);
+    let shade = egui::Color32::from_rgba_premultiplied(0x0B, 0x0D, 0x10, 200);
     if windows.is_empty() {
         // Everything is taken: no shading at all.
     } else {
@@ -219,22 +228,34 @@ pub fn ui(
             egui::pos2(a.max(b), band.bottom()),
         );
         let picked = *selected == i;
+        let edge = if picked { TEXT } else { MUTED };
         paint.rect(
             here,
-            egui::CornerRadius::same(3),
-            ACCENT.gamma_multiply(if picked { 0.14 } else { 0.07 }),
-            egui::Stroke::new(if picked { 1.5 } else { 1.0 }, ACCENT),
+            egui::CornerRadius::same(4),
+            egui::Color32::from_white_alpha(if picked { 10 } else { 4 }),
+            egui::Stroke::new(if picked { 2.0 } else { 1.0 }, edge),
             egui::StrokeKind::Inside,
         );
+        // A handle at each end, to show where to take hold.
         for x in [a, b] {
-            paint.rect_filled(
-                egui::Rect::from_center_size(
-                    egui::pos2(x, here.center().y),
-                    egui::vec2(5.0, here.height() * 0.8),
-                ),
-                egui::CornerRadius::same(2),
-                if picked { ACCENT } else { ACCENT.gamma_multiply(0.7) },
+            let handle = egui::Rect::from_center_size(
+                egui::pos2(x, here.center().y),
+                egui::vec2(8.0, (here.height() * 0.5).clamp(18.0, 34.0)),
             );
+            paint.rect(
+                handle,
+                egui::CornerRadius::same(3),
+                edge,
+                egui::Stroke::new(1.0, ACCENT_DEEP),
+                egui::StrokeKind::Outside,
+            );
+            for k in [-1.0, 1.0] {
+                paint.hline(
+                    (handle.left() + 2.0)..=(handle.right() - 2.0),
+                    handle.center().y + k * 3.0,
+                    egui::Stroke::new(1.0, ACCENT_DEEP),
+                );
+            }
         }
     }
 
@@ -336,20 +357,18 @@ pub fn ui(
         && grab.is_none()
     {
         let x = p.x.clamp(rect.left(), rect.right());
-        paint.vline(
-            x,
-            band.top()..=band.bottom(),
-            egui::Stroke::new(1.0, MUTED.gamma_multiply(0.7)),
+        paint.vline(x, band.top()..=band.bottom(), egui::Stroke::new(1.0, ACCENT));
+        // The exact time under the pointer, in a pill over the scale.
+        let galley = paint.layout_no_wrap(
+            convert::filetime_to_short(t_of(x)),
+            egui::FontId::proportional(12.0),
+            theme::ON_ACCENT,
         );
-        let text = convert::filetime_to_short(t_of(x));
-        let at = egui::pos2(x.min(rect.right() - 54.0).max(rect.left() + 54.0), rect.top() + 1.0);
-        paint.text(
-            at,
-            egui::Align2::CENTER_TOP,
-            text,
-            egui::FontId::proportional(11.0),
-            TEXT,
-        );
+        let size = galley.size() + egui::vec2(14.0, 4.0);
+        let left = (x - size.x / 2.0).clamp(rect.left(), rect.right() - size.x);
+        let pill = egui::Rect::from_min_size(egui::pos2(left, rect.top()), size);
+        paint.rect_filled(pill, egui::CornerRadius::same(4), ACCENT);
+        paint.galley(pill.min + egui::vec2(7.0, 2.0), galley, theme::ON_ACCENT);
         ui.ctx().set_cursor_icon(match cursor_over(windows, p, rect, &x_of) {
             Some(true) => egui::CursorIcon::ResizeHorizontal,
             Some(false) => egui::CursorIcon::Grab,
@@ -434,6 +453,7 @@ fn take_hold(
 fn hours(
     paint: &egui::Painter,
     rect: egui::Rect,
+    band: egui::Rect,
     lo: i64,
     hi: i64,
     x_of: &impl Fn(i64) -> f32,
@@ -453,8 +473,8 @@ fn hours(
         24 * 3600 * SECOND,
         7 * 24 * 3600 * SECOND,
     ];
-    // About one label per 120 pixels keeps them from touching.
-    let wanted = ((hi - lo) as f64 / (rect.width() / 120.0).max(1.0) as f64) as i64;
+    // About one label per 130 pixels keeps them from touching.
+    let wanted = ((hi - lo) as f64 / (rect.width() / 130.0).max(1.0) as f64) as i64;
     let step = STEPS
         .iter()
         .copied()
@@ -466,24 +486,26 @@ fn hours(
     while t <= hi {
         if t >= lo {
             let x = x_of(t);
+            let stamp = convert::filetime_to_short(t);
+            // Midnight is where the date changes, so it is drawn brighter and
+            // says which day begins.
+            let midnight = &stamp[11..19] == "00:00:00";
             paint.vline(
                 x,
-                rect.top() + AXIS_H - 3.0..=rect.bottom() - 6.0,
-                egui::Stroke::new(1.0, EDGE),
+                band.top()..=band.bottom(),
+                egui::Stroke::new(1.0, if midnight { DIM } else { EDGE }),
             );
-            let stamp = convert::filetime_to_short(t);
-            let label = if day {
-                stamp[..10].to_string()
+            let label = if day || midnight {
+                format!("{}.", &stamp[..5])
             } else {
-                // dd.mm HH:MM, which is as much as fits and as much as helps.
-                format!("{} {}", &stamp[..5], &stamp[11..16])
+                stamp[11..16].to_string()
             };
             paint.text(
-                egui::pos2(x, rect.top()),
-                egui::Align2::LEFT_TOP,
+                egui::pos2(x, rect.top() + 4.0),
+                egui::Align2::CENTER_TOP,
                 label,
-                egui::FontId::proportional(10.0),
-                MUTED,
+                egui::FontId::proportional(12.0),
+                if midnight || day { TEXT } else { MUTED },
             );
         }
         t += step;

@@ -13,7 +13,7 @@ use egui_plot::{
 
 use crate::chart::Loaded;
 use crate::convert;
-use crate::theme::{self, ACCENT, DIM, MUTED, body, muted, strong};
+use crate::theme::{self, ACCENT, DIM, MUTED, body, hint, muted, strong};
 
 /// The shapes this view can draw.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,14 +42,14 @@ impl Kind {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Lines => "Lines",
-            Self::Area => "Area",
-            Self::Steps => "Steps",
-            Self::Scatter => "Scatter",
-            Self::Multiples => "Small multiples",
-            Self::Histogram => "Histogram",
-            Self::Box => "Box plot",
-            Self::Correlation => "Correlation",
+            Self::Lines => "Linien",
+            Self::Area => "Fläche",
+            Self::Steps => "Stufen",
+            Self::Scatter => "Punkte",
+            Self::Multiples => "Einzeln",
+            Self::Histogram => "Histogramm",
+            Self::Box => "Boxplot",
+            Self::Correlation => "Korrelation",
         }
     }
 
@@ -193,52 +193,45 @@ impl PlotView {
         ui.add_space(theme::GAP);
         egui::Panel::left(ui.id().with("tags"))
             .resizable(true)
-            .default_size(272.0)
-            .frame(theme::card())
+            .default_size(300.0)
+            .show_separator_line(false)
+            .frame(theme::panel().inner_margin(egui::Margin::same(14)))
             .show(ui, |ui| self.side(ui));
+        ui.add_space(theme::GAP);
         self.plot(ui);
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        {
             ui.horizontal_wrapped(|ui| {
-                for k in Kind::ALL {
-                    if ui
-                        .selectable_label(self.kind == k, body(k.label()))
-                        .clicked()
-                    {
-                        self.kind = k;
-                        self.reset = true;
-                    }
+                let options: Vec<(Kind, &str, &str)> =
+                    Kind::ALL.iter().map(|k| (*k, k.label(), "")).collect();
+                if theme::segmented(ui, &mut self.kind, &options) {
+                    self.reset = true;
                 }
-            });
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .checkbox(&mut self.log_y, "Log scale")
-                    .on_hover_text("Values of nought or less cannot be shown on it")
+                ui.add_space(12.0);
+                if theme::check(ui, &mut self.log_y, "Logarithmisch")
+                    .on_hover_text("Werte von null oder kleiner lassen sich darauf nicht zeigen")
                     .changed()
                 {
                     self.reset = true;
                 }
-                if ui
-                    .checkbox(&mut self.normalise, "Normalise 0-100%")
-                    .on_hover_text("Each tag against its own range, for tags in different units")
+                if theme::check(ui, &mut self.normalise, "Normiert 0–100 %")
+                    .on_hover_text("Jeder Tag in seinem eigenen Bereich, für Tags in verschiedenen Einheiten")
                     .changed()
                 {
                     self.reset = true;
                 }
-                ui.checkbox(&mut self.crosshair, "Crosshair");
+                theme::check(ui, &mut self.crosshair, "Fadenkreuz");
 
                 if self.kind == Kind::Correlation {
-                    ui.separator();
+                    ui.add_space(12.0);
                     self.tag_picker(ui, "X", true);
                     self.tag_picker(ui, "Y", false);
                 }
                 if self.kind == Kind::Histogram {
-                    ui.separator();
-                    ui.label(muted("Buckets"));
+                    ui.add_space(12.0);
+                    ui.label(hint("Klassen"));
                     if ui
                         .add(egui::Slider::new(&mut self.bins, 5..=80).logarithmic(false))
                         .changed()
@@ -247,27 +240,24 @@ impl PlotView {
                     }
                 }
 
-                ui.separator();
-                if ui
-                    .button("Reset view")
-                    .on_hover_text(
-                        "Back to everything in sight. Double-clicking the chart does it too.",
-                    )
+                ui.add_space(12.0);
+                if theme::quiet(ui, "Ansicht zurücksetzen")
+                    .on_hover_text("Wieder alles im Blick. Ein Doppelklick ins Diagramm tut dasselbe.")
                     .clicked()
                 {
                     self.reset = true;
                 }
             });
-        });
+        }
     }
 
     fn tag_picker(&mut self, ui: &mut egui::Ui, label: &str, is_x: bool) {
         let current = if is_x { self.x } else { self.y };
         let name = self.display.get(current).cloned().unwrap_or_default();
-        ui.label(muted(label));
+        ui.label(hint(label));
         egui::ComboBox::from_id_salt(if is_x { "x-tag" } else { "y-tag" })
-            .selected_text(crate::elide(&name, 26))
-            .width(200.0)
+            .selected_text(name)
+            .width(260.0)
             .show_ui(ui, |ui| {
                 for (i, name) in self.display.iter().enumerate() {
                     let picked = i == current;
@@ -290,11 +280,12 @@ impl PlotView {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("filter tags...")
-                            .desired_width((ui.available_width() - 66.0).max(70.0)),
+                            .hint_text("Tags filtern …")
+                            .desired_width((ui.available_width() - 76.0).max(70.0))
+                            .margin(egui::vec2(8.0, 6.0)),
                     );
                     ui.label(muted(format!(
-                        "{} of {}",
+                        "{} von {}",
                         self.chosen().len(),
                         self.data.series.len()
                     )));
@@ -304,17 +295,17 @@ impl PlotView {
                     let shown: Vec<usize> = (0..self.data.series.len())
                         .filter(|&i| self.matches(i))
                         .collect();
-                    if ui.small_button("All").clicked() {
+                    if theme::quiet(ui, "Alle").clicked() {
                         for i in &shown {
                             self.on[*i] = true;
                         }
                     }
-                    if ui.small_button("None").clicked() {
+                    if theme::quiet(ui, "Keine").clicked() {
                         for i in &shown {
                             self.on[*i] = false;
                         }
                     }
-                    if ui.small_button("Invert").clicked() {
+                    if theme::quiet(ui, "Umkehren").clicked() {
                         for i in &shown {
                             self.on[*i] = !self.on[*i];
                         }
@@ -333,7 +324,7 @@ impl PlotView {
                                 continue;
                             }
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.on[i], "");
+                                theme::check(ui, &mut self.on[i], "");
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(10.0, 10.0),
                                     egui::Sense::hover(),
@@ -347,14 +338,14 @@ impl PlotView {
                                         self.colours[i].gamma_multiply(0.3)
                                     },
                                 );
-                                let name = crate::elide_end(&self.display[i], 30);
+                                let name = self.display[i].clone();
                                 let text = if self.on[i] {
                                     body(name)
                                 } else {
                                     body(name).color(DIM)
                                 };
-                                ui.label(text).on_hover_text(format!(
-                                    "{}\n{} points",
+                                ui.add(egui::Label::new(text).wrap()).on_hover_text(format!(
+                                    "{}\n{} Punkte",
                                     self.data.series[i].name,
                                     self.data.series[i].points.len()
                                 ));
@@ -383,7 +374,9 @@ impl PlotView {
                                         egui::CornerRadius::same(2),
                                         self.colours[*i],
                                     );
-                                    ui.label(muted(crate::elide_end(&self.display[*i], 22)));
+                                    ui.add(
+                                        egui::Label::new(muted(self.display[*i].clone())).wrap(),
+                                    );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -431,16 +424,16 @@ impl PlotView {
     fn plot(&mut self, ui: &mut egui::Ui) {
         let ids = self.chosen();
         if ids.is_empty() && self.kind != Kind::Correlation {
-            theme::card().show(ui, |ui| {
+            theme::panel().show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 ui.centered_and_justified(|ui| {
-                    ui.label(muted("Pick at least one tag on the left."))
+                    ui.label(hint("Links mindestens einen Tag auswählen."))
                 });
             });
             return;
         }
 
-        theme::card().show(ui, |ui| {
+        theme::panel().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             match self.kind {
                 Kind::Multiples => self.multiples(ui, &ids),
@@ -461,8 +454,8 @@ impl PlotView {
             .allow_double_click_reset(true)
             .show_crosshair(self.crosshair)
             .show_grid([true, true])
-            .grid_color(egui::Color32::from_rgb(0x23, 0x28, 0x30))
-            .cursor_color(ACCENT.gamma_multiply(0.7))
+            .grid_color(theme::EDGE)
+            .cursor_color(ACCENT)
             .show_background(false)
             .y_axis_min_width(58.0)
             .x_axis_formatter(|mark, _| time_label(mark.value))
@@ -610,7 +603,7 @@ impl PlotView {
                             ui.allocate_ui(cell, |ui| {
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        egui::RichText::new(crate::elide_end(&name, 34))
+                                        egui::RichText::new(name.clone())
                                             .small()
                                             .color(colour),
                                     );
@@ -690,8 +683,8 @@ impl PlotView {
             .x_axis_formatter(move |m, _| {
                 format_value(if log { 10f64.powf(m.value) } else { m.value })
             })
-            .x_axis_label("value")
-            .y_axis_label("readings");
+            .x_axis_label("Wert")
+            .y_axis_label("Anzahl");
         if self.reset {
             plot = plot.reset();
         }
@@ -751,7 +744,7 @@ impl PlotView {
                 shown
                     .iter()
                     .find(|(at, _)| (at - m.value).abs() < 0.01)
-                    .map(|(_, n)| crate::elide_end(n, 20))
+                    .map(|(_, n)| n.clone())
                     .unwrap_or_default()
             });
         if self.reset {
@@ -766,7 +759,7 @@ impl PlotView {
     fn correlation(&mut self, ui: &mut egui::Ui) {
         let (Some(a), Some(b)) = (self.data.series.get(self.x), self.data.series.get(self.y))
         else {
-            ui.centered_and_justified(|ui| ui.label(muted("Pick two tags above.")));
+            ui.centered_and_justified(|ui| ui.label(hint("Oben zwei Tags auswählen.")));
             return;
         };
 
@@ -793,8 +786,8 @@ impl PlotView {
             .allow_boxed_zoom(true)
             .show_crosshair(self.crosshair)
             .y_axis_min_width(58.0)
-            .x_axis_label(crate::elide_end(&xn, 40))
-            .y_axis_label(crate::elide_end(&yn, 40))
+            .x_axis_label(xn.clone())
+            .y_axis_label(yn.clone())
             .label_formatter(move |pos| match pos {
                 HoverPosition::NearDataPoint { position, .. }
                 | HoverPosition::Elsewhere { position } => Some(format!(
@@ -808,7 +801,7 @@ impl PlotView {
         }
         plot.show(ui, |plot_ui| {
             plot_ui.points(
-                Points::new(format!("{yn} against {xn}"), pairs)
+                Points::new(format!("{yn} gegen {xn}"), pairs)
                     .color(colour)
                     .radius(2.0),
             );
@@ -819,12 +812,12 @@ impl PlotView {
     /// The line under the chart, for the screen that holds this view.
     pub fn caption(&self) -> String {
         format!(
-            "{} tags, {} points drawn of {}{}",
+            "{} Tags · {} von {} Punkten{}",
             self.data.series.len(),
             crate::sep(self.data.drawn),
             crate::sep(self.data.read),
             if self.data.skipped_text > 0 {
-                format!(" - {} text tags left out", self.data.skipped_text)
+                format!(" · {} Text-Tags ausgelassen", self.data.skipped_text)
             } else {
                 String::new()
             }
