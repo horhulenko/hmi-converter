@@ -3252,10 +3252,17 @@ pub fn elide(s: &str, max: usize) -> String {
 
 /// Show a file in the system file manager, selected.
 fn reveal(path: &Path) {
+    // Explorer reads its own command line: `/select,` must be followed by the
+    // path in quotes, and the quotes must not wrap the switch as well. Quoting
+    // the whole argument the usual way makes it give up on any path with a
+    // space in it -- every `OneDrive - Firma` folder -- and open Documents.
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", path.display()))
-        .spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", windows_path(path).display()))
+            .spawn();
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open")
         .arg("-R")
@@ -3270,11 +3277,25 @@ fn reveal(path: &Path) {
 /// Open a folder itself.
 fn open_folder(dir: &Path) {
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("\"{}\"", windows_path(dir).display()))
+            .spawn();
+    }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(dir).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
+/// A path Explorer understands: absolute, with backslashes only. Explorer
+/// takes a relative or mixed-slash path for something it does not know and
+/// falls back to the Documents folder.
+#[cfg(target_os = "windows")]
+pub fn windows_path(path: &Path) -> PathBuf {
+    let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    PathBuf::from(full.to_string_lossy().replace('/', "\\"))
 }
 
 #[cfg(test)]

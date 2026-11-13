@@ -484,7 +484,10 @@ pub fn open(path: &Path) {
     {
         // `explorer` hands the file to whatever opens .html, and unlike `start`
         // it needs no shell.
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("\"{}\"", crate::windows_path(path).display()))
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(path).spawn();
