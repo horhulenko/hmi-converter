@@ -110,7 +110,11 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.icon_width = 18.0;
         s.spacing.icon_width_inner = 10.0;
         s.spacing.icon_spacing = 8.0;
+        // A scroll bar with room of its own, so it never lies over the
+        // right-hand edge of a panel.
+        s.spacing.scroll = egui::style::ScrollStyle::solid();
         s.spacing.scroll.bar_width = 8.0;
+        s.spacing.scroll.bar_outer_margin = 4.0;
 
         let v = &mut s.visuals;
         v.dark_mode = true;
@@ -414,48 +418,192 @@ pub enum Step {
     Later,
 }
 
-/// The heading of one step: a numbered disc and its title. Whatever is added
-/// in `right` sits at the far end of the line.
-pub fn step_header(
+/// How far the content of a step is set in from the rail.
+pub const RAIL: f32 = 48.0;
+
+/// One step of the setup screen: a numbered disc on the rail at the left, a
+/// line down to the next step, and the content set in beside it -- so the
+/// screen reads as one path from top to bottom rather than loose blocks.
+pub fn step<R>(
     ui: &mut egui::Ui,
     number: usize,
+    state: Step,
+    last: bool,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let left = ui.cursor().min.x;
+    let width = ui.available_width();
+    let spacing = ui.spacing().item_spacing;
+    let out = ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(RAIL);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = spacing;
+            ui.set_width(width - RAIL);
+            // Where the title row really begins -- the spacing before the
+            // step has been added by now -- so the disc sits level with it.
+            let top = ui.cursor().min.y;
+            (top, content(ui))
+        })
+        .inner
+    });
+    let (top, inner) = out.inner;
+    let bottom = out.response.rect.bottom();
+
+    let paint = ui.painter();
+    let c = egui::pos2(left + 15.0, top + TITLE_ROW / 2.0);
+    if !last {
+        // Down to the next disc, which sits one section further on.
+        paint.vline(
+            c.x,
+            (c.y + 20.0)..=(bottom + SECTION - 4.0),
+            Stroke::new(
+                2.0,
+                if state == Step::Done {
+                    ACCENT.gamma_multiply(0.45)
+                } else {
+                    EDGE
+                },
+            ),
+        );
+    }
+    match state {
+        Step::Current => {
+            paint.circle_filled(c, 15.0, ACCENT);
+        }
+        Step::Done => {
+            paint.circle_filled(c, 15.0, ACCENT_DEEP);
+            paint.circle_stroke(c, 15.0, Stroke::new(1.5, ACCENT));
+        }
+        Step::Later => {
+            paint.circle_filled(c, 15.0, BG);
+            paint.circle_stroke(c, 14.5, Stroke::new(1.5, EDGE));
+        }
+    }
+    if state == Step::Done {
+        // A finished step shows a tick rather than its number.
+        paint.line(
+            vec![
+                c + egui::vec2(-5.5, 0.5),
+                c + egui::vec2(-1.5, 4.5),
+                c + egui::vec2(6.0, -4.0),
+            ],
+            Stroke::new(2.2, ACCENT_HOVER),
+        );
+    } else {
+        // A figure in Noto Sans sits half a pixel below the middle of its
+        // line at this size, so the line is lifted by that much.
+        paint.text(
+            c - egui::vec2(0.0, 0.5),
+            egui::Align2::CENTER_CENTER,
+            number.to_string(),
+            FontId::new(15.0, bold_family()),
+            if state == Step::Current { ON_ACCENT } else { DIM },
+        );
+    }
+    inner
+}
+
+/// The height of the title line of a step, which its disc is centred on.
+const TITLE_ROW: f32 = 34.0;
+
+/// The title of a step, and under it one line saying what to do there.
+/// `right` sits at the far end of the title line.
+pub fn step_title(
+    ui: &mut egui::Ui,
     text: &str,
+    subtitle: &str,
     state: Step,
     right: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(32.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-        let paint = ui.painter();
-        let c = rect.center();
-        match state {
-            Step::Current => {
-                paint.circle_filled(c, 13.0, ACCENT);
-            }
-            Step::Done => {
-                paint.circle_filled(c, 13.0, ACCENT_DEEP);
-                paint.circle_stroke(c, 13.0, Stroke::new(1.0, ACCENT));
-            }
-            Step::Later => {
-                paint.circle_stroke(c, 12.5, Stroke::new(1.0, EDGE));
-            }
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.set_min_height(TITLE_ROW);
+            ui.label(title(text).color(if state == Step::Later { DIM } else { TEXT }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+        });
+        if !subtitle.is_empty() {
+            ui.label(hint(subtitle).color(if state == Step::Later { DIM } else { MUTED }));
         }
-        let digit_colour = match state {
-            Step::Current => ON_ACCENT,
-            Step::Done => ACCENT_HOVER,
-            Step::Later => DIM,
-        };
-        paint.text(
-            c + egui::vec2(0.0, 0.5),
-            egui::Align2::CENTER_CENTER,
-            number.to_string(),
-            FontId::new(14.0, bold_family()),
-            digit_colour,
-        );
-        ui.add_space(4.0);
-        ui.label(title(text).color(if state == Step::Later { DIM } else { TEXT }));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
     });
+}
+
+/// A hairline across the width of whatever it is in.
+pub fn divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, EDGE));
+}
+
+/// A tinted strip for something that must be read: a warning, an error.
+pub fn banner(ui: &mut egui::Ui, text: impl Into<String>, colour: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(colour.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0, colour.gamma_multiply(0.35)))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 18.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, colour);
+                ui.add(egui::Label::new(body(text).color(TEXT)).wrap());
+            });
+        })
+        .response
+}
+
+/// A short bar showing how much of a whole is kept.
+pub fn meter(ui: &mut egui::Ui, fraction: f32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(3), RAISED_HOVER);
+    let f = fraction.clamp(0.0, 1.0);
+    if f > 0.0 {
+        let filled = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2((rect.width() * f).max(3.0), rect.height()),
+        );
+        ui.painter().rect_filled(filled, CornerRadius::same(3), ACCENT);
+    }
+}
+
+/// A row of a settings form: the grey name in a column of its own, the
+/// controls beside it, all on one baseline.
+pub fn form_row(ui: &mut egui::Ui, label: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        ui.set_min_height(44.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 32.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_width(width);
+                ui.set_min_height(32.0);
+                ui.label(hint(label));
+            },
+        );
+        add(ui);
+    });
+}
+
+/// Content of `width` at most, centred in what there is: for the screens
+/// that report a result, which read best as one column.
+pub fn column<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let w = width.min(ui.available_width());
+    let side = ((ui.available_width() - w) / 2.0).max(0.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(side);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            ui.set_width(w);
+            add(ui)
+        })
+        .inner
+    })
+    .inner
 }
 
 /// A small tag for what a file holds. Drawn rather than written, so it stays

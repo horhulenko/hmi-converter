@@ -193,7 +193,7 @@ impl PlotView {
         ui.add_space(theme::GAP);
         egui::Panel::left(ui.id().with("tags"))
             .resizable(true)
-            .default_size(300.0)
+            .default_size(310.0)
             .show_separator_line(false)
             .frame(theme::panel().inner_margin(egui::Margin::same(14)))
             .show(ui, |ui| self.side(ui));
@@ -201,46 +201,32 @@ impl PlotView {
         self.plot(ui);
     }
 
+    /// One row above the chart: what kind of chart on the left, the way
+    /// back to the whole view on the right. The settings belonging to one
+    /// kind only appear beside it while it is chosen.
     fn controls(&mut self, ui: &mut egui::Ui) {
-        {
-            ui.horizontal_wrapped(|ui| {
-                let options: Vec<(Kind, &str, &str)> =
-                    Kind::ALL.iter().map(|k| (*k, k.label(), "")).collect();
-                if theme::segmented(ui, &mut self.kind, &options) {
-                    self.reset = true;
-                }
+        ui.horizontal(|ui| {
+            let options: Vec<(Kind, &str, &str)> =
+                Kind::ALL.iter().map(|k| (*k, k.label(), "")).collect();
+            if theme::segmented(ui, &mut self.kind, &options) {
+                self.reset = true;
+            }
+            if self.kind == Kind::Correlation {
                 ui.add_space(12.0);
-                if theme::check(ui, &mut self.log_y, "Logarithmisch")
-                    .on_hover_text("Werte von null oder kleiner lassen sich darauf nicht zeigen")
+                self.tag_picker(ui, "X", true);
+                self.tag_picker(ui, "Y", false);
+            }
+            if self.kind == Kind::Histogram {
+                ui.add_space(12.0);
+                ui.label(hint("Klassen"));
+                if ui
+                    .add(egui::Slider::new(&mut self.bins, 5..=80).logarithmic(false))
                     .changed()
                 {
                     self.reset = true;
                 }
-                if theme::check(ui, &mut self.normalise, "Normiert 0–100 %")
-                    .on_hover_text("Jeder Tag in seinem eigenen Bereich, für Tags in verschiedenen Einheiten")
-                    .changed()
-                {
-                    self.reset = true;
-                }
-                theme::check(ui, &mut self.crosshair, "Fadenkreuz");
-
-                if self.kind == Kind::Correlation {
-                    ui.add_space(12.0);
-                    self.tag_picker(ui, "X", true);
-                    self.tag_picker(ui, "Y", false);
-                }
-                if self.kind == Kind::Histogram {
-                    ui.add_space(12.0);
-                    ui.label(hint("Klassen"));
-                    if ui
-                        .add(egui::Slider::new(&mut self.bins, 5..=80).logarithmic(false))
-                        .changed()
-                    {
-                        self.reset = true;
-                    }
-                }
-
-                ui.add_space(12.0);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::quiet(ui, "Ansicht zurücksetzen")
                     .on_hover_text("Wieder alles im Blick. Ein Doppelklick ins Diagramm tut dasselbe.")
                     .clicked()
@@ -248,7 +234,26 @@ impl PlotView {
                     self.reset = true;
                 }
             });
+        });
+    }
+
+    /// How the values are drawn, at the top of the side bar.
+    fn view_options(&mut self, ui: &mut egui::Ui) {
+        ui.label(muted("Darstellung"));
+        ui.spacing_mut().item_spacing.y = 0.0;
+        if theme::check(ui, &mut self.log_y, "Logarithmisch")
+            .on_hover_text("Werte von null oder kleiner lassen sich darauf nicht zeigen")
+            .changed()
+        {
+            self.reset = true;
         }
+        if theme::check(ui, &mut self.normalise, "Normiert 0–100 %")
+            .on_hover_text("Jeder Tag in seinem eigenen Bereich, für Tags in verschiedenen Einheiten")
+            .changed()
+        {
+            self.reset = true;
+        }
+        theme::check(ui, &mut self.crosshair, "Fadenkreuz");
     }
 
     fn tag_picker(&mut self, ui: &mut egui::Ui, label: &str, is_x: bool) {
@@ -275,8 +280,13 @@ impl PlotView {
 
     /// The tag list, and under it the readout of what stands at the cursor.
     fn side(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| self.view_options(ui));
+        ui.add_space(10.0);
+        theme::divider(ui);
+        ui.add_space(10.0);
         {
             {
+                ui.label(muted("Tags"));
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
@@ -319,11 +329,13 @@ impl PlotView {
                     .id_salt("plot-tags")
                     .max_height(list_height)
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for i in 0..self.data.series.len() {
                             if !self.matches(i) {
                                 continue;
                             }
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 theme::check(ui, &mut self.on[i], "");
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(10.0, 10.0),
@@ -374,8 +386,19 @@ impl PlotView {
                                         egui::CornerRadius::same(2),
                                         self.colours[*i],
                                     );
-                                    ui.add(
-                                        egui::Label::new(muted(self.display[*i].clone())).wrap(),
+                                    // The name wraps in a column of its own, so it
+                                    // never runs into the number beside it.
+                                    let w = (ui.available_width() - 84.0).max(60.0);
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(w, 18.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_width(w);
+                                            ui.add(
+                                                egui::Label::new(muted(self.display[*i].clone()))
+                                                    .wrap(),
+                                            );
+                                        },
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -501,12 +524,6 @@ impl PlotView {
 
         let mut plot = self
             .base("over-time")
-            .legend(
-                Legend::default()
-                    .position(Corner::RightTop)
-                    .background_alpha(0.85)
-                    .text_style(egui::TextStyle::Small),
-            )
             .coordinates_formatter(
                 Corner::LeftBottom,
                 CoordinatesFormatter::new(move |p: &PlotPoint, _| {

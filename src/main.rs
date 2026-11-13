@@ -564,6 +564,8 @@ struct App {
     selected: usize,
     /// An edge or a window being dragged on the timeline.
     grab: Option<timeline::Grab>,
+    /// Earlier arrangements of the slices, newest last, to go back to.
+    undo: Vec<Vec<Range>>,
     from_text: String,
     until_text: String,
     /// What is wrong with what was typed, if anything.
@@ -613,6 +615,7 @@ impl App {
             windows: Vec::new(),
             selected: 0,
             grab: None,
+            undo: Vec::new(),
             from_text: String::new(),
             until_text: String::new(),
             range_error: None,
@@ -685,6 +688,26 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Keep the slices as they are now, before something changes them.
+    fn remember_slices(&mut self, slices: Vec<Range>) {
+        if self.undo.last() != Some(&slices) {
+            self.undo.push(slices);
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
+        }
+    }
+
+    /// Go back to the slices as they were before the last change.
+    fn undo_slices(&mut self) {
+        if let Some(earlier) = self.undo.pop() {
+            self.windows = earlier;
+            self.selected = self.selected.min(self.windows.len().saturating_sub(1));
+            self.grab = None;
+            self.text_from_window();
         }
     }
 
@@ -1254,17 +1277,32 @@ impl eframe::App for App {
 
         let setup = matches!(self.state, State::Setup);
         let plotting = matches!(self.state, State::Plotting(_));
+
+        // The setup screen ends in a bar across the whole window: what is
+        // about to happen on the left, the buttons that do it on the right.
+        if setup {
+            egui::Panel::bottom("action")
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(theme::MARGIN, 18)),
+                )
+                .show(ui, |ui| {
+                    let r = ui.max_rect();
+                    ui.painter().with_clip_rect(egui::Rect::EVERYTHING).hline(
+                        (r.left() - 100.0)..=(r.right() + 100.0),
+                        r.top() - 18.0,
+                        egui::Stroke::new(1.0, theme::EDGE),
+                    );
+                    self.action_bar(ui);
+                });
+        }
+
         egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::same(theme::MARGIN))
             .show(ui, |ui| {
                 if setup {
-                    egui::Panel::bottom("action")
-                        .show_separator_line(false)
-                        .frame(egui::Frame::new().inner_margin(egui::Margin {
-                            top: 18,
-                            ..egui::Margin::ZERO
-                        }))
-                        .show(ui, |ui| self.action_bar(ui));
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| self.setup_view(ui));
@@ -1284,7 +1322,7 @@ impl eframe::App for App {
                 }
             });
 
-        if matches!(self.state, State::Setup) {
+        if setup {
             self.columns_window(&ctx);
         }
         if hovering {
@@ -1332,15 +1370,18 @@ fn drop_overlay(ctx: &egui::Context) {
 impl App {
     // -- choosing files and options ---------------------------------------
 
-    /// Three steps, top to bottom: what comes in, which part of it, and what
-    /// goes out. The button that does it waits underneath.
+    /// Three steps on one rail, top to bottom: what comes in, which part of
+    /// it, and what goes out. The bar underneath does it.
     fn setup_view(&mut self, ui: &mut egui::Ui) {
         let loaded = !self.sources.is_empty();
-        self.files_step(ui);
+        let later = if loaded { Step::Current } else { Step::Later };
+        theme::step(ui, 1, if loaded { Step::Done } else { Step::Current }, false, |ui| {
+            self.files_step(ui)
+        });
         ui.add_space(theme::SECTION);
-        self.range_step(ui, loaded);
+        theme::step(ui, 2, later, false, |ui| self.range_step(ui, loaded));
         ui.add_space(theme::SECTION);
-        self.output_step(ui, loaded);
+        theme::step(ui, 3, later, true, |ui| self.output_step(ui, loaded));
         ui.add_space(theme::GAP);
     }
 
@@ -1348,50 +1389,27 @@ impl App {
 
     fn files_step(&mut self, ui: &mut egui::Ui) {
         let loaded = !self.sources.is_empty();
-        let mut picked: Option<Vec<PathBuf>> = None;
-        let mut clear = false;
-        theme::step_header(
+        theme::step_title(
             ui,
-            1,
-            "Dateien",
-            if loaded { Step::Done } else { Step::Current },
-            |ui| {
-                if !loaded {
-                    return;
-                }
-                if theme::quiet(ui, "Liste leeren")
-                    .on_hover_text("Alle Dateien aus der Liste nehmen")
-                    .clicked()
-                {
-                    clear = true;
-                }
-                if theme::quiet(ui, "Ordner hinzufügen …").clicked() {
-                    picked = pick_folder();
-                }
-                if theme::quiet(ui, "Dateien hinzufügen …").clicked() {
-                    picked = pick_databases();
-                }
+            "Dateien laden",
+            if loaded {
+                "Ankreuzen, was umgewandelt wird. Ein Klick auf die Zeile schaltet sie um."
+            } else {
+                "Die Datenbanken aus dem HMI-Export: Tag-Namen und Messwerte."
             },
+            if loaded { Step::Done } else { Step::Current },
+            |_| {},
         );
-        ui.add_space(theme::GAP);
+        ui.add_space(theme::GAP + 2.0);
 
-        if loaded {
-            self.file_table(ui);
-            ui.add_space(theme::GAP);
-            self.files_summary(ui);
-        } else if let Some(files) = self.drop_zone(ui) {
-            picked = Some(files);
-        }
+        let picked = if loaded {
+            let picked = self.file_table(ui);
+            self.file_warnings(ui);
+            picked
+        } else {
+            self.drop_zone(ui)
+        };
         self.notes_view(ui);
-
-        if clear {
-            self.sources.clear();
-            self.filter.clear();
-            self.notes.clear();
-            self.preview_key = None;
-            self.windows.clear();
-            self.text_from_window();
-        }
         if let Some(files) = picked {
             self.accept(files);
         }
@@ -1462,31 +1480,17 @@ impl App {
     }
 
     /// Every database that was found, what is inside it, and a tick to leave
-    /// it out of the import.
-    fn file_table(&mut self, ui: &mut egui::Ui) {
+    /// it out of the import. Its foot says what the selection adds up to and
+    /// holds the ways to change the list. Returns files picked to add.
+    fn file_table(&mut self, ui: &mut egui::Ui) -> Option<Vec<PathBuf>> {
         let all = self.sources.len();
         let on = self.included().count();
         let mut every: Option<bool> = None;
-
-        if all > 8 {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Dateien filtern …")
-                        .desired_width(240.0),
-                );
-                if theme::quiet(ui, "Auswahl umkehren").clicked() {
-                    for s in &mut self.sources {
-                        s.on = !s.on;
-                    }
-                    self.preview_key = None;
-                }
-            });
-            ui.add_space(6.0);
-        }
+        let mut picked: Option<Vec<PathBuf>> = None;
+        let mut clear = false;
 
         theme::panel()
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let cols = Cols::new(ui.available_width());
@@ -1507,7 +1511,15 @@ impl App {
                         }
                     });
                     cell(ui, cols.name, egui::Align::Min, |ui| {
-                        ui.label(muted("Datei"));
+                        if all > 8 {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.filter)
+                                    .hint_text("Datei filtern …")
+                                    .desired_width(cols.name.min(260.0)),
+                            );
+                        } else {
+                            ui.label(muted("Datei"));
+                        }
                     });
                     cell(ui, cols.role, egui::Align::Min, |ui| {
                         ui.label(muted("Inhalt"));
@@ -1520,13 +1532,62 @@ impl App {
                     });
                     cell(ui, cols.drop, egui::Align::Center, |_| {});
                 });
+                theme::divider(ui);
                 let room = (ui.clip_rect().height() * 0.4).clamp(150.0, 420.0);
                 self.table_rows(ui, &cols, room);
+                theme::divider(ui);
+
+                // -- the foot: what this adds up to, and the list's own tools
+                ui.horizontal(|ui| {
+                    ui.set_min_height(34.0);
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(strong(format!("{on} von {all}")));
+                    ui.label(hint("ausgewählt"));
+                    if let Some((a, b)) = self.total_span() {
+                        ui.label(hint("·"));
+                        ui.label(hint(format!(
+                            "{} – {}",
+                            convert::filetime_to_short(a),
+                            convert::filetime_to_short(b)
+                        )));
+                    }
+                    if !self.tag_dbs().is_empty() {
+                        ui.label(hint("·"));
+                        ui.label(hint(format!("{} Tag-Namen", sep(self.total_tags() as u64))));
+                    }
+                    if self.scan.is_some() {
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::quiet(ui, "Leeren")
+                            .on_hover_text("Alle Dateien aus der Liste nehmen")
+                            .clicked()
+                        {
+                            clear = true;
+                        }
+                        if theme::quiet(ui, "+ Ordner").on_hover_text("Einen Ordner durchsuchen").clicked() {
+                            picked = pick_folder();
+                        }
+                        if theme::quiet(ui, "+ Dateien").on_hover_text("Weitere Dateien hinzufügen").clicked() {
+                            picked = pick_databases();
+                        }
+                    });
+                });
             });
 
         if let Some(v) = every {
             self.set_all(v);
         }
+        if clear {
+            self.sources.clear();
+            self.filter.clear();
+            self.notes.clear();
+            self.preview_key = None;
+            self.windows.clear();
+            self.undo.clear();
+            self.text_from_window();
+        }
+        picked
     }
 
     fn set_all(&mut self, on: bool) {
@@ -1556,6 +1617,7 @@ impl App {
             .max_height(room)
             .auto_shrink([false, true])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 if shown.is_empty() {
                     ui.label(hint("Keine Datei passt zum Filter."));
                 }
@@ -1602,63 +1664,27 @@ impl App {
         }
     }
 
-    /// The line under the table: what the import adds up to, and anything
-    /// about it worth a warning.
-    fn files_summary(&mut self, ui: &mut egui::Ui) {
+    /// What about the chosen files must not be missed.
+    fn file_warnings(&mut self, ui: &mut egui::Ui) {
         let values = self.value_dbs().len();
         let tag_dbs = self.tag_dbs().len();
-        let scanning = self.scan.is_some();
-
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if scanning {
-                ui.spinner();
-                ui.label(hint("Suche weitere Dateien …"));
-            }
-            if values == 0 {
-                return;
-            }
-            match self.total_values() {
-                Some(n) => {
-                    ui.label(strong(format!("{} Werte", sep(n))));
-                }
-                None => {
-                    ui.spinner();
-                    ui.label(hint("Werte werden gezählt …"));
-                }
-            }
-            ui.label(hint(format!(
-                "aus {values} {}",
-                if values == 1 { "Datei" } else { "Dateien" }
-            )));
-            if let Some((a, b)) = self.total_span() {
-                ui.label(hint("·"));
-                ui.label(hint(format!(
-                    "{} – {}",
-                    convert::filetime_to_short(a),
-                    convert::filetime_to_short(b)
-                )));
-            }
-            if tag_dbs > 0 {
-                ui.label(hint("·"));
-                ui.label(hint(format!("{} Tag-Namen", sep(self.total_tags() as u64))));
-            }
-        });
-
+        let warn = |ui: &mut egui::Ui, text: String| {
+            ui.add_space(6.0);
+            theme::banner(ui, text, WARN)
+        };
         if values == 0 {
-            theme::warning(ui, "Keine Datei mit Messwerten ausgewählt.", WARN);
+            warn(ui, "Keine Datei mit Messwerten ausgewählt.".into());
         } else if tag_dbs == 0 {
-            theme::warning(
+            warn(
                 ui,
-                "Keine Tag-Datenbank dabei – Tags heißen dann id_<Nummer>.",
-                WARN,
+                "Keine Tag-Datenbank ausgewählt – die Tags heißen dann id_<Nummer>.".into(),
             );
         }
         // One line, whatever the number of pairs: the files are named in the
         // table above, and the first pair in the hover text.
         let overlaps = self.overlaps();
         if let Some((a, b)) = overlaps.first() {
-            theme::warning(
+            warn(
                 ui,
                 match overlaps.len() {
                     1 => format!(
@@ -1670,7 +1696,6 @@ impl App {
                          würden doppelt geschrieben."
                     ),
                 },
-                WARN,
             )
             .on_hover_text(format!("zum Beispiel\n{a}\nund\n{b}"));
         }
@@ -1681,31 +1706,25 @@ impl App {
     /// Cut the log down to a slice of time -- or several -- with the files
     /// drawn underneath, so it is clear what is being cut.
     fn range_step(&mut self, ui: &mut egui::Ui, loaded: bool) {
-        theme::step_header(
-            ui,
-            2,
-            "Zeitraum",
-            if loaded { Step::Current } else { Step::Later },
-            |ui| {
-                if loaded {
-                    self.kept_label(ui);
-                }
-            },
-        );
+        let state = if loaded { Step::Current } else { Step::Later };
+        let subtitle = if !loaded {
+            "Optional: nur einen Ausschnitt umwandeln."
+        } else {
+            match self.windows.len() {
+                0 => "Optional: über die Leiste ziehen, um nur einen Ausschnitt umzuwandeln.",
+                1 => "An den Griffen ziehen zum Anpassen, in der Mitte zum Verschieben.",
+                _ => "Nur was in den Ausschnitten liegt, wird umgewandelt.",
+            }
+        };
+        theme::step_title(ui, "Zeitraum wählen", subtitle, state, |ui| {
+            if loaded {
+                self.kept_label(ui);
+            }
+        });
         if !loaded {
             return;
         }
-        ui.add_space(4.0);
-        ui.label(hint(match self.windows.len() {
-            0 => "Alles wird umgewandelt. Über die Leiste ziehen, um nur einen Ausschnitt \
-                  zu nehmen."
-                .to_string(),
-            1 => "Ein Ausschnitt. An den Griffen ziehen, um ihn anzupassen, oder in der \
-                  Mitte, um ihn zu verschieben."
-                .to_string(),
-            n => format!("{n} Ausschnitte. Nur was darin liegt, wird umgewandelt."),
-        }));
-        ui.add_space(theme::GAP);
+        ui.add_space(theme::GAP + 2.0);
 
         let bounds = self.data_bounds();
         let lanes: Vec<timeline::Lane> = self
@@ -1721,7 +1740,24 @@ impl App {
                 })
             })
             .collect();
-        let changed = timeline::ui(
+        // Esc while dragging puts the slices back as they were before the
+        // drag; Ctrl+Z steps back through every change.
+        if self.grab.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.undo_slices();
+        }
+        let typing = ui.ctx().memory(|m| m.focused().is_some());
+        if !typing
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::Z,
+                ))
+            })
+        {
+            self.undo_slices();
+        }
+        let before = self.windows.clone();
+        let edit = timeline::ui(
             ui,
             &lanes,
             bounds,
@@ -1729,13 +1765,17 @@ impl App {
             &mut self.selected,
             &mut self.grab,
         );
-        if changed {
+        if edit.began {
+            self.remember_slices(before);
+        }
+        if edit.changed {
             self.text_from_window();
         }
-        ui.add_space(theme::GAP + 2.0);
+        ui.add_space(theme::GAP);
 
-        // -- the exact dates of whichever slice is chosen
-        ui.horizontal_wrapped(|ui| {
+        // -- the exact dates of whichever slice is chosen, and the tools for
+        //    slices, lined up under the two ends of the timeline
+        ui.horizontal(|ui| {
             let last_from = self.last.from.clone();
             let last_until = self.last.until.clone();
             let mut edited = false;
@@ -1745,7 +1785,7 @@ impl App {
             };
             let slice = self.windows.get(self.selected).copied();
             edited |= range_field(ui, "Von", &mut self.from_text, exact(slice.and_then(|w| w.from)));
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             edited |= range_field(
                 ui,
                 "Bis",
@@ -1767,6 +1807,7 @@ impl App {
                     ))
                     .clicked()
             {
+                self.remember_slices(self.windows.clone());
                 self.from_text = last_from.trim().to_string();
                 self.until_text = last_until.trim().to_string();
                 edited = true;
@@ -1775,12 +1816,14 @@ impl App {
                 self.text_edited();
             }
 
-            ui.add_space(12.0);
-            self.range_buttons(ui, self.data_bounds());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.range_buttons(ui, self.data_bounds());
+            });
         });
 
         if let Some(e) = &self.range_error {
-            theme::warning(ui, e.clone(), BAD);
+            ui.add_space(4.0);
+            theme::banner(ui, e.clone(), BAD);
         }
         // -- every slice, for picking one without aiming at the timeline
         if self.windows.len() > 1 {
@@ -1789,53 +1832,71 @@ impl App {
         }
     }
 
-    /// Split / remove / start again, which is all a slice needs besides
-    /// dragging.
+    /// Split / remove / start again, as one group: all a slice needs besides
+    /// dragging. Laid out right to left, so the group ends where the
+    /// timeline ends.
     fn range_buttons(&mut self, ui: &mut egui::Ui, bounds: Option<(i64, i64)>) {
         let any = !self.windows.is_empty();
-        if theme::quiet_enabled(ui, "Teilen", any)
-            .on_hover_text(
-                "Den gewählten Ausschnitt halbieren, damit die Hälften auseinandergezogen \
-                 und die Mitte ausgelassen werden kann",
-            )
-            .clicked()
-            && let Some(w) = self.windows.get(self.selected).copied()
-            && let (Some(a), Some(b)) = (
-                w.from.or(bounds.map(|x| x.0)),
-                w.until.or(bounds.map(|x| x.1)),
-            )
-            && b > a + 20_000_000
-        {
-            let mid = a + (b - a) / 2;
-            self.windows[self.selected] = Range {
-                from: Some(a),
-                until: Some(mid),
-            };
-            self.windows.insert(
-                self.selected + 1,
-                Range {
-                    from: Some(mid),
-                    until: Some(b),
-                },
-            );
-            self.text_from_window();
-        }
-        if theme::quiet_enabled(ui, "Entfernen", any)
-            .on_hover_text("Den gewählten Ausschnitt verwerfen")
-            .clicked()
-        {
-            self.windows.remove(self.selected.min(self.windows.len() - 1));
-            self.selected = self.selected.min(self.windows.len().saturating_sub(1));
-            self.text_from_window();
-        }
-        if theme::quiet_enabled(ui, "Alles", any)
-            .on_hover_text("Alle Ausschnitte verwerfen und den ganzen Zeitraum umwandeln")
-            .clicked()
-        {
-            self.windows.clear();
-            self.selected = 0;
-            self.text_from_window();
-        }
+        egui::Frame::new()
+            .fill(theme::SURFACE)
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(2))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if theme::quiet_enabled(ui, "Alles", any)
+                    .on_hover_text("Alle Ausschnitte verwerfen und den ganzen Zeitraum umwandeln")
+                    .clicked()
+                {
+                    self.remember_slices(self.windows.clone());
+                    self.windows.clear();
+                    self.selected = 0;
+                    self.text_from_window();
+                }
+                if theme::quiet_enabled(ui, "Entfernen", any)
+                    .on_hover_text("Den gewählten Ausschnitt verwerfen")
+                    .clicked()
+                {
+                    self.remember_slices(self.windows.clone());
+                    self.windows.remove(self.selected.min(self.windows.len() - 1));
+                    self.selected = self.selected.min(self.windows.len().saturating_sub(1));
+                    self.text_from_window();
+                }
+                if theme::quiet_enabled(ui, "Teilen", any)
+                    .on_hover_text(
+                        "Den gewählten Ausschnitt halbieren, damit die Hälften \
+                         auseinandergezogen und die Mitte ausgelassen werden kann",
+                    )
+                    .clicked()
+                    && let Some(w) = self.windows.get(self.selected).copied()
+                    && let (Some(a), Some(b)) = (
+                        w.from.or(bounds.map(|x| x.0)),
+                        w.until.or(bounds.map(|x| x.1)),
+                    )
+                    && b > a + 20_000_000
+                {
+                    self.remember_slices(self.windows.clone());
+                    let mid = a + (b - a) / 2;
+                    self.windows[self.selected] = Range {
+                        from: Some(a),
+                        until: Some(mid),
+                    };
+                    self.windows.insert(
+                        self.selected + 1,
+                        Range {
+                            from: Some(mid),
+                            until: Some(b),
+                        },
+                    );
+                    self.text_from_window();
+                }
+                let can_undo = !self.undo.is_empty();
+                if theme::quiet_enabled(ui, "Rückgängig", can_undo)
+                    .on_hover_text("Die letzte Änderung an den Ausschnitten zurücknehmen (Strg+Z)")
+                    .clicked()
+                {
+                    self.undo_slices();
+                }
+            });
     }
 
     /// One chip per slice: which one is being edited, and a way to drop it.
@@ -1877,19 +1938,22 @@ impl App {
             self.text_from_window();
         }
         if let Some(i) = drop {
+            self.remember_slices(self.windows.clone());
             self.windows.remove(i);
             self.selected = self.selected.min(self.windows.len().saturating_sub(1));
             self.text_from_window();
         }
     }
 
-    /// How much of the log the slices keep, live.
+    /// How much of the log the slices keep, live: a short bar and the count,
+    /// beside the title, so the effect of a drag is seen at once. Drawn
+    /// right to left.
     fn kept_label(&mut self, ui: &mut egui::Ui) {
         if self.value_dbs().is_empty() {
             return;
         }
         if self.windows().map(|w| w.is_open()).unwrap_or(false) {
-            ui.label(hint("ganzer Zeitraum"));
+            theme::chip(ui, "ganzer Zeitraum", true);
             return;
         }
         let total: u64 = self
@@ -1902,12 +1966,16 @@ impl App {
                 ui.label(body("Keine Werte im Ausschnitt").color(BAD));
             }
             Some(kept) => {
+                let share = kept as f32 / total.max(1) as f32;
                 ui.label(hint(format!("von {}", sep(total))));
                 ui.label(strong(format!("{} Werte", sep(kept))));
+                ui.add_space(6.0);
+                ui.label(strong(format!("{:.0} %", share * 100.0)).color(theme::ACCENT_HOVER));
+                theme::meter(ui, share, 90.0);
             }
             None => {
-                ui.spinner();
                 ui.label(hint("wird gezählt …"));
+                ui.spinner();
             }
         }
     }
@@ -1915,122 +1983,133 @@ impl App {
     // -- step 3: what comes out --------------------------------------------
 
     fn output_step(&mut self, ui: &mut egui::Ui, loaded: bool) {
-        theme::step_header(
+        let state = if loaded { Step::Current } else { Step::Later };
+        theme::step_title(
             ui,
-            3,
-            "Ausgabe",
-            if loaded { Step::Current } else { Step::Later },
+            "Ausgabe festlegen",
+            "Was in die CSV-Dateien kommt und wohin sie gespeichert werden.",
+            state,
             |_| {},
         );
         if !loaded {
             return;
         }
-        ui.add_space(theme::GAP);
-        const LABEL: f32 = 128.0;
+        ui.add_space(theme::GAP + 2.0);
+        const LABEL: f32 = 140.0;
 
-        // -- what to write
-        ui.horizontal_wrapped(|ui| {
-            row_label(ui, "Schreiben", LABEL);
-            theme::check(ui, &mut self.write_long, "Lange Tabelle")
-                .on_hover_text("Eine Zeile je Messwert");
-            if self.write_long {
-                let chosen = self.columns().len();
-                if theme::quiet(
-                    ui,
-                    &format!("Spalten ({chosen} von {}) …", Column::ALL.len()),
-                )
-                .on_hover_text("Spalten auswählen, ordnen und umbenennen")
-                .clicked()
-                {
-                    self.columns_open = true;
-                }
-            }
-            ui.add_space(14.0);
-            theme::check(ui, &mut self.write_wide, "Breite Tabelle")
-                .on_hover_text("Eine Zeile je Zeitpunkt, eine Spalte je Tag");
-            ui.add_space(14.0);
-            theme::check(ui, &mut self.semicolon, "Trennzeichen ;")
-                .on_hover_text("Semikolon statt Komma, für Excel mit deutschem Dezimalkomma");
-            ui.add_space(14.0);
-            theme::check(ui, &mut self.shorten_names, "Tag-Namen kürzen")
-                .on_hover_text("Nur den Teil behalten, der die Tags unterscheidet");
-        });
-        if self.shorten_names {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(LABEL + ui.spacing().item_spacing.x);
-                match self.shorten_example() {
-                    Some((full, short)) => {
-                        ui.label(muted(full));
-                        ui.label(muted("wird zu"));
-                        ui.label(muted(short).color(TEXT));
+        theme::panel()
+            .inner_margin(egui::Margin::symmetric(16, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                // -- which tables
+                theme::form_row(ui, "Tabellen", LABEL, |ui| {
+                    theme::check(ui, &mut self.write_long, "Lang")
+                        .on_hover_text("Eine Zeile je Messwert");
+                    if self.write_long {
+                        let chosen = self.columns().len();
+                        if theme::quiet(
+                            ui,
+                            &format!("Spalten ({chosen} von {}) …", Column::ALL.len()),
+                        )
+                        .on_hover_text("Spalten auswählen, ordnen und umbenennen")
+                        .clicked()
+                        {
+                            self.columns_open = true;
+                        }
                     }
-                    None => {
-                        ui.label(muted("Für ein Beispiel eine Tag-Datenbank auswählen."));
+                    ui.add_space(18.0);
+                    theme::check(ui, &mut self.write_wide, "Breit")
+                        .on_hover_text("Eine Zeile je Zeitpunkt, eine Spalte je Tag");
+                    if !self.write_long && !self.write_wide {
+                        ui.add_space(12.0);
+                        ui.label(body("mindestens eine auswählen").color(WARN));
                     }
+                });
+                theme::divider(ui);
+
+                // -- how they are written
+                theme::form_row(ui, "Format", LABEL, |ui| {
+                    theme::check(ui, &mut self.semicolon, "Semikolon als Trennzeichen")
+                        .on_hover_text("Für Excel mit deutschem Dezimalkomma");
+                    ui.add_space(18.0);
+                    theme::check(ui, &mut self.shorten_names, "Tag-Namen kürzen")
+                        .on_hover_text("Nur den Teil behalten, der die Tags unterscheidet");
+                });
+                if self.shorten_names {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(LABEL + ui.spacing().item_spacing.x);
+                        match self.shorten_example() {
+                            Some((full, short)) => {
+                                ui.label(muted(full));
+                                ui.label(muted("wird zu"));
+                                ui.label(muted(short).color(TEXT));
+                            }
+                            None => {
+                                ui.label(muted("Für ein Beispiel eine Tag-Datenbank auswählen."));
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
                 }
-            });
-        }
+                theme::divider(ui);
 
-        // -- where it goes
-        ui.horizontal_wrapped(|ui| {
-            row_label(ui, "Speichern als", LABEL);
-            let mut name = self.base_name();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut name)
-                        .desired_width(240.0)
-                        .margin(egui::vec2(8.0, 6.0)),
-                )
-                .on_hover_text(format!(
-                    "Der Teil vor _long.csv und _wide.csv
-
-wird geschrieben: {}",
-                    self.output_files().join(", ")
-                ))
-                .changed()
-            {
-                self.base_name = Some(name);
-            }
-            ui.label(hint("in"));
-            match self.chosen_dir() {
-                Some(dir) => {
+                // -- where they go
+                theme::form_row(ui, "Speichern als", LABEL, |ui| {
+                    let mut name = self.base_name();
                     if ui
                         .add(
-                            egui::Label::new(body(shown_path(&dir)))
-                                .wrap()
-                                .sense(egui::Sense::click()),
+                            egui::TextEdit::singleline(&mut name)
+                                .desired_width(240.0)
+                                .margin(egui::vec2(8.0, 6.0)),
                         )
-                        .on_hover_text("Ordner im Explorer öffnen")
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Der Teil vor _long.csv und _wide.csv")
+                        .changed()
+                    {
+                        self.base_name = Some(name);
+                    }
+                    ui.label(hint("in"));
+                    match self.chosen_dir() {
+                        Some(dir) => {
+                            if ui
+                                .add(
+                                    egui::Label::new(body(shown_path(&dir)))
+                                        .wrap()
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("Ordner im Explorer öffnen")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                open_folder(&dir);
+                            }
+                        }
+                        None => {
+                            ui.label(hint("dem Ordner der ersten Datenbank"));
+                        }
+                    }
+                    if theme::quiet(ui, "Ändern …")
+                        .on_hover_text("Ordner und Namen im Explorer wählen")
                         .clicked()
                     {
-                        open_folder(&dir);
+                        self.browse_output();
                     }
-                }
-                None => {
-                    ui.label(hint("dem Ordner der ersten Datenbank"));
-                }
-            }
-            if theme::quiet(ui, "Ändern …")
-                .on_hover_text("Ordner und Namen im Explorer wählen")
-                .clicked()
-            {
-                self.browse_output();
-            }
-        });
-        if self.output_files().is_empty() {
-            theme::warning(ui, "Mindestens eine Tabelle auswählen.", WARN);
-        }
+                });
+                theme::divider(ui);
 
-        // -- how much goes into a chart
-        ui.horizontal_wrapped(|ui| {
-            row_label(ui, "Diagramm", LABEL);
-            let options: Vec<(Detail, &str, &str)> = [Detail::Light, Detail::Balanced, Detail::Full]
-                .into_iter()
-                .map(|d| (d, d.label(), d.describe()))
-                .collect();
-            theme::segmented(ui, &mut self.detail, &options);
-        });
+                // -- how much goes into a chart
+                theme::form_row(ui, "Diagramm-Detail", LABEL, |ui| {
+                    let options: Vec<(Detail, &str, &str)> =
+                        [Detail::Light, Detail::Balanced, Detail::Full]
+                            .into_iter()
+                            .map(|d| (d, d.label(), d.describe()))
+                            .collect();
+                    theme::segmented(ui, &mut self.detail, &options);
+                    ui.add_space(8.0);
+                    ui.label(muted(self.detail.describe()));
+                });
+            });
     }
 
     /// Write the column arrangement to the settings file, so reopening the
@@ -2161,54 +2240,80 @@ wird geschrieben: {}",
         }
     }
 
-    /// The button that does the job, with the two ways of charting beside it,
-    /// and underneath it, whatever still stands in the way.
+    /// The bar under the steps: on the left, in so many words, what pressing
+    /// the button will do -- or what still stands in the way; on the right,
+    /// the button, with the two ways of charting before it.
     fn action_bar(&mut self, ui: &mut egui::Ui) {
         let ready = self.ready();
         let can_chart = !self.value_dbs().is_empty() && self.windows().is_ok();
-        let gap = ui.spacing().item_spacing.x;
-        let chart_width = 150.0_f32.min(ui.available_width() * 0.22);
-        let main_width = ui.available_width() - chart_width * 2.0 - gap * 2.0;
-        let caption = match (ready, self.total_values()) {
-            (true, Some(n)) => format!("{} Werte umwandeln", sep(n)),
-            _ => "In CSV umwandeln".to_string(),
-        };
+        let files = self.value_dbs().len();
 
         ui.horizontal(|ui| {
-            if theme::primary(ui, &caption, ready, egui::vec2(main_width, 48.0)).clicked() {
-                self.start();
-            }
-            if theme::secondary(ui, "Diagramm", can_chart, egui::vec2(chart_width, 48.0))
-                .on_hover_text("Die Werte hier im Fenster zeichnen")
-                .clicked()
-            {
-                self.start_plot();
-            }
-            if theme::secondary(ui, "Im Browser", can_chart, egui::vec2(chart_width, 48.0))
-                .on_hover_text("Eine eigenständige Seite schreiben und im Browser öffnen")
-                .clicked()
-            {
-                self.start_chart();
-            }
-        });
+            ui.set_min_height(48.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                if ready {
+                    match self.total_values() {
+                        Some(n) => {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    egui::RichText::new(sep(n))
+                                        .font(egui::FontId::new(20.0, theme::bold_family()))
+                                        .color(TEXT),
+                                );
+                                ui.label(body(format!(
+                                    "Werte aus {files} {}",
+                                    if files == 1 { "Datei" } else { "Dateien" }
+                                )));
+                            });
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(body("Werte werden gezählt …"));
+                            });
+                        }
+                    }
+                    ui.label(muted(format!("ergibt  {}", self.output_files().join("  ·  "))));
+                } else {
+                    let (why, how) = if self.sources.is_empty() {
+                        ("Noch keine Dateien", "Oben die HMI-Datenbanken hineinziehen oder wählen.")
+                    } else if self.value_dbs().is_empty() {
+                        ("Keine Messwerte ausgewählt", "Mindestens eine Datei mit Werten ankreuzen.")
+                    } else if !self.write_long && !self.write_wide {
+                        ("Keine Tabelle gewählt", "Unter Ausgabe „Lang“ oder „Breit“ ankreuzen.")
+                    } else if self.write_long && self.columns().is_empty() {
+                        ("Die lange Tabelle hat keine Spalten", "Unter Ausgabe „Spalten …“ öffnen.")
+                    } else if self.total_values() == Some(0) {
+                        ("Keine Werte im Zeitraum", "Den Ausschnitt verschieben oder vergrößern.")
+                    } else {
+                        ("Zeitraum unklar", "Die Eingabe unter Von und Bis prüfen.")
+                    };
+                    ui.label(strong(why).color(MUTED));
+                    ui.label(muted(how));
+                }
+            });
 
-        if !ready {
-            let why = if self.sources.is_empty() {
-                "Zuerst Dateien hinzufügen"
-            } else if self.value_dbs().is_empty() {
-                "Mindestens eine Datei mit Messwerten auswählen"
-            } else if !self.write_long && !self.write_wide {
-                "Mindestens eine Tabelle auswählen"
-            } else if self.write_long && self.columns().is_empty() {
-                "Die lange Tabelle hat keine Spalten"
-            } else if self.total_values() == Some(0) {
-                "Im gewählten Zeitraum liegen keine Werte"
-            } else {
-                "Zeitraum prüfen"
-            };
-            ui.add_space(6.0);
-            ui.label(hint(why));
-        }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::primary(ui, "In CSV umwandeln", ready, egui::vec2(220.0, 46.0)).clicked() {
+                    self.start();
+                }
+                ui.add_space(4.0);
+                if theme::secondary(ui, "Im Browser", can_chart, egui::vec2(124.0, 46.0))
+                    .on_hover_text("Eine eigenständige Diagrammseite schreiben und öffnen")
+                    .clicked()
+                {
+                    self.start_chart();
+                }
+                if theme::secondary(ui, "Diagramm", can_chart, egui::vec2(124.0, 46.0))
+                    .on_hover_text("Die Werte hier im Fenster zeichnen")
+                    .clicked()
+                {
+                    self.start_plot();
+                }
+            });
+        });
     }
 
     // -- while it runs -----------------------------------------------------
@@ -2225,28 +2330,41 @@ wird geschrieben: {}",
         };
         let (stage, done, total, cancel) = (stage.clone(), *done, *total, cancel.clone());
 
-        ui.add_space((ui.available_height() * 0.28).max(40.0));
-        ui.vertical_centered(|ui| {
-            ui.label(theme::title(format!("{stage} …")));
-            ui.add_space(18.0);
-            let width = ui.available_width().min(520.0);
-            theme::progress(
-                ui,
-                (total > 0).then(|| done as f32 / total as f32),
-                width,
-            );
-            ui.add_space(8.0);
-            ui.label(hint(if total > 0 {
-                format!("{} von {} Zeilen", sep(done), sep(total))
-            } else {
-                "wird vorbereitet".into()
-            }));
+        ui.add_space((ui.available_height() * 0.3).max(40.0));
+        theme::column(ui, 520.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::title(format!("{stage} …")));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if total > 0 {
+                        ui.label(
+                            strong(format!(
+                                "{:.0} %",
+                                done as f32 / total as f32 * 100.0
+                            ))
+                            .color(theme::ACCENT_HOVER),
+                        );
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            theme::progress(ui, (total > 0).then(|| done as f32 / total as f32), 520.0);
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(muted(if total > 0 {
+                    format!("{} von {} Zeilen", sep(done), sep(total))
+                } else {
+                    "wird vorbereitet".into()
+                }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(muted("Die Quelldateien werden nur gelesen."));
+                });
+            });
             ui.add_space(28.0);
-            if theme::secondary(ui, "Abbrechen", true, egui::vec2(150.0, 38.0)).clicked() {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            ui.add_space(14.0);
-            ui.label(muted("Die Quelldateien werden nur gelesen, nie verändert."));
+            ui.vertical_centered(|ui| {
+                if theme::secondary(ui, "Abbrechen", true, egui::vec2(150.0, 40.0)).clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
         });
     }
 
@@ -2255,106 +2373,117 @@ wird geschrieben: {}",
         let State::Done(s) = &self.state else { return };
         let s = s.clone();
 
-        result_heading(
-            ui,
-            "Fertig",
-            format!(
-                "{} Werte · {} Tags · {} {} · {} s",
-                sep(s.rows),
-                s.tags_used,
-                s.sources.len(),
-                if s.sources.len() == 1 {
-                    "Datenbank"
-                } else {
-                    "Datenbanken"
-                },
-                decimal(s.secs as f64, 1)
-            ),
-        );
-        ui.add_space(theme::SECTION);
-
-        for (path, rows) in &s.files {
-            written_file(
+        ui.add_space(24.0);
+        theme::column(ui, 760.0, |ui| {
+            result_heading(
                 ui,
-                path,
-                format!("{} Zeilen · {}", sep(*rows), human_size(path)),
-            );
-            ui.add_space(6.0);
-        }
-
-        if s.bad_quality > 0 {
-            theme::warning(
-                ui,
+                "Umwandlung fertig",
                 format!(
-                    "{} Zeilen haben eine andere Qualität als 192 – sie sind enthalten, \
-                     siehe Spalte Quality.",
-                    sep(s.bad_quality)
+                    "{} Werte · {} Tags · {} {} · {} s",
+                    sep(s.rows),
+                    s.tags_used,
+                    s.sources.len(),
+                    if s.sources.len() == 1 {
+                        "Datenbank"
+                    } else {
+                        "Datenbanken"
+                    },
+                    decimal(s.secs as f64, 1)
                 ),
-                WARN,
             );
-        }
-        if !s.unknown_ids.is_empty() {
-            theme::warning(
-                ui,
-                format!(
-                    "{} Tag-Nummern hatten keinen Namen und heißen id_<Nummer>.",
-                    s.unknown_ids.len()
-                ),
-                WARN,
-            );
-        }
+            ui.add_space(theme::SECTION);
 
-        ui.add_space(theme::GAP);
-        egui::CollapsingHeader::new(hint("Details"))
-            .id_salt("done-details")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                if let Some((a, b)) = s.span {
-                    kv(
-                        ui,
-                        "Zeitraum",
-                        format!(
-                            "{} – {}",
-                            convert::filetime_to_short(a),
-                            convert::filetime_to_short(b)
-                        ),
-                    );
-                }
-                kv(
+            let files: Vec<(PathBuf, String)> = s
+                .files
+                .iter()
+                .map(|(path, rows)| {
+                    (
+                        path.clone(),
+                        format!("{} Zeilen · {}", sep(*rows), human_size(path)),
+                    )
+                })
+                .collect();
+            written_files(ui, "Geschrieben", &files);
+
+            if s.bad_quality > 0 {
+                ui.add_space(6.0);
+                theme::banner(
                     ui,
-                    "Tags",
-                    format!("{} von {} haben Werte", s.tags_used, s.tags_total),
+                    format!(
+                        "{} Zeilen haben eine andere Qualität als 192 – sie sind enthalten, \
+                         siehe Spalte Quality.",
+                        sep(s.bad_quality)
+                    ),
+                    WARN,
                 );
-                kv(ui, "Zeitpunkte", sep(s.timestamps));
-                for (k, (path, rows)) in s.sources.iter().enumerate() {
+            }
+            if !s.unknown_ids.is_empty() {
+                ui.add_space(6.0);
+                theme::banner(
+                    ui,
+                    format!(
+                        "{} Tag-Nummern hatten keinen Namen und heißen id_<Nummer>.",
+                        s.unknown_ids.len()
+                    ),
+                    WARN,
+                );
+            }
+
+            ui.add_space(theme::GAP);
+            egui::CollapsingHeader::new(hint("Details"))
+                .id_salt("done-details")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    if let Some((a, b)) = s.span {
+                        kv(
+                            ui,
+                            "Zeitraum",
+                            format!(
+                                "{} – {}",
+                                convert::filetime_to_short(a),
+                                convert::filetime_to_short(b)
+                            ),
+                        );
+                    }
                     kv(
                         ui,
-                        if k == 0 { "Quellen" } else { "" },
-                        format!("{} Werte aus {}", sep(*rows), file_name(path)),
+                        "Tags",
+                        format!("{} von {} haben Werte", s.tags_used, s.tags_total),
                     );
-                }
-            });
+                    kv(ui, "Zeitpunkte", sep(s.timestamps));
+                    for (k, (path, rows)) in s.sources.iter().enumerate() {
+                        kv(
+                            ui,
+                            if k == 0 { "Quellen" } else { "" },
+                            format!("{} Werte aus {}", sep(*rows), file_name(path)),
+                        );
+                    }
+                });
 
-        ui.add_space(theme::SECTION);
-        let size = egui::vec2(170.0, 42.0);
-        ui.horizontal_wrapped(|ui| {
-            if theme::primary(ui, "Ordner öffnen", true, size).clicked()
-                && let Some((p, _)) = s.files.first()
-            {
-                reveal(p);
-            }
-            if theme::secondary(ui, "Diagramm", true, egui::vec2(140.0, 42.0)).clicked() {
-                self.start_plot();
-            }
-            if theme::secondary(ui, "Im Browser", true, egui::vec2(140.0, 42.0)).clicked() {
-                self.start_chart();
-            }
-            ui.add_space(8.0);
-            if theme::quiet(ui, "Weitere Dateien umwandeln").clicked() {
-                self.state = State::Setup;
-                self.notes.clear();
-            }
+            ui.add_space(theme::SECTION);
+            ui.horizontal(|ui| {
+                if theme::primary(ui, "Ordner öffnen", true, egui::vec2(180.0, 44.0)).clicked()
+                    && let Some((p, _)) = s.files.first()
+                {
+                    reveal(p);
+                }
+                if theme::secondary(ui, "Diagramm", true, egui::vec2(124.0, 44.0)).clicked() {
+                    self.start_plot();
+                }
+                if theme::secondary(ui, "Im Browser", true, egui::vec2(124.0, 44.0)).clicked() {
+                    self.start_chart();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::quiet(ui, "Weitere umwandeln")
+                        .on_hover_text("Zurück zu den Dateien")
+                        .clicked()
+                    {
+                        self.state = State::Setup;
+                        self.notes.clear();
+                    }
+                });
+            });
         });
     }
 
@@ -2405,43 +2534,48 @@ wird geschrieben: {}",
             c.secs,
         );
 
-        result_heading(
-            ui,
-            "Diagramm geöffnet",
-            format!(
-                "{tags} Tags · {} von {} Punkten · {} s",
-                sep(drawn),
-                sep(read),
-                decimal(secs as f64, 1)
-            ),
-        );
-        ui.add_space(theme::SECTION);
-        written_file(
-            ui,
-            &path,
-            format!(
-                "{} · eine Datei, funktioniert ohne Internet",
-                human_bytes(bytes)
-            ),
-        );
-        if skipped > 0 {
-            ui.add_space(4.0);
-            theme::warning(
+        ui.add_space(24.0);
+        theme::column(ui, 760.0, |ui| {
+            result_heading(
                 ui,
-                format!("{skipped} Tags enthalten Text statt Zahlen und werden nicht gezeichnet."),
-                WARN,
+                "Diagramm im Browser geöffnet",
+                format!(
+                    "{tags} Tags · {} von {} Punkten · {} s",
+                    sep(drawn),
+                    sep(read),
+                    decimal(secs as f64, 1)
+                ),
             );
-        }
+            ui.add_space(theme::SECTION);
+            written_files(
+                ui,
+                "Geschrieben",
+                &[(
+                    path.clone(),
+                    format!("{} · eine Datei, funktioniert ohne Internet", human_bytes(bytes)),
+                )],
+            );
+            if skipped > 0 {
+                ui.add_space(6.0);
+                theme::banner(
+                    ui,
+                    format!("{skipped} Tags enthalten Text statt Zahlen und werden nicht gezeichnet."),
+                    WARN,
+                );
+            }
 
-        ui.add_space(theme::SECTION);
-        ui.horizontal(|ui| {
-            if theme::primary(ui, "Erneut öffnen", true, egui::vec2(170.0, 42.0)).clicked() {
-                chart::open(&path);
-            }
-            if theme::secondary(ui, "Zurück", true, egui::vec2(140.0, 42.0)).clicked() {
-                self.state = State::Setup;
-                self.notes.clear();
-            }
+            ui.add_space(theme::SECTION);
+            ui.horizontal(|ui| {
+                if theme::primary(ui, "Erneut öffnen", true, egui::vec2(180.0, 44.0)).clicked() {
+                    chart::open(&path);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::quiet(ui, "Zurück zu den Dateien").clicked() {
+                        self.state = State::Setup;
+                        self.notes.clear();
+                    }
+                });
+            });
         });
     }
 
@@ -2452,36 +2586,32 @@ wird geschrieben: {}",
         let msg = msg.clone();
         let cancelled = msg == "cancelled";
 
-        ui.label(theme::heading(if cancelled {
-            "Abgebrochen"
-        } else {
-            "Das hat nicht geklappt"
-        }));
-        ui.add_space(theme::GAP);
-        if cancelled {
-            ui.label(hint(
-                "Es wurde nichts fertiggestellt. Halb geschriebene CSV-Dateien können \
-                 gelöscht werden.",
-            ));
-        } else {
-            egui::Frame::new()
-                .fill(BAD.gamma_multiply(0.12))
-                .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.add(egui::Label::new(body(msg).color(BAD)).wrap());
-                });
+        ui.add_space(24.0);
+        theme::column(ui, 760.0, |ui| {
+            ui.label(theme::heading(if cancelled {
+                "Abgebrochen"
+            } else {
+                "Das hat nicht geklappt"
+            }));
             ui.add_space(theme::GAP);
-            ui.label(hint(
-                "Stammen die Dateien aus demselben HMI-Export, und darf in den \
-                 Ausgabeordner geschrieben werden?",
-            ));
-        }
-        ui.add_space(theme::SECTION);
-        if theme::primary(ui, "Zurück", true, egui::vec2(150.0, 42.0)).clicked() {
-            self.state = State::Setup;
-        }
+            if cancelled {
+                ui.label(hint(
+                    "Es wurde nichts fertiggestellt. Halb geschriebene CSV-Dateien können \
+                     gelöscht werden.",
+                ));
+            } else {
+                theme::banner(ui, msg, BAD);
+                ui.add_space(theme::GAP);
+                ui.label(hint(
+                    "Stammen die Dateien aus demselben HMI-Export, und darf in den \
+                     Ausgabeordner geschrieben werden?",
+                ));
+            }
+            ui.add_space(theme::SECTION);
+            if theme::primary(ui, "Zurück zu den Dateien", true, egui::vec2(220.0, 44.0)).clicked() {
+                self.state = State::Setup;
+            }
+        });
     }
 
     fn notes_view(&mut self, ui: &mut egui::Ui) {
@@ -2512,37 +2642,52 @@ fn result_heading(ui: &mut egui::Ui, title: &str, line: String) {
     });
 }
 
-/// One file that was written: its name to click, what is in it, and a way to
-/// find it.
-fn written_file(ui: &mut egui::Ui, path: &Path, detail: String) {
-    theme::panel().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                if ui
-                    .add(egui::Label::new(strong(file_name(path))).sense(egui::Sense::click()))
-                    .on_hover_text(path.display().to_string())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    reveal(path);
+/// The files that were written, in one panel: each name to click, what is in
+/// it, and a way to find it.
+fn written_files(ui: &mut egui::Ui, title: &str, files: &[(PathBuf, String)]) {
+    ui.label(muted(title));
+    ui.add_space(2.0);
+    theme::panel()
+        .inner_margin(egui::Margin::symmetric(16, 4))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (k, (path, detail)) in files.iter().enumerate() {
+                if k > 0 {
+                    theme::divider(ui);
                 }
-                ui.label(muted(detail));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::quiet(ui, "Im Ordner zeigen").clicked() {
-                    reveal(path);
-                }
-            });
+                ui.horizontal(|ui| {
+                    ui.set_min_height(58.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        if ui
+                            .add(
+                                egui::Label::new(strong(file_name(path)))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(path.display().to_string())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            reveal(path);
+                        }
+                        ui.label(muted(detail));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::quiet(ui, "Im Ordner zeigen").clicked() {
+                            reveal(path);
+                        }
+                    });
+                });
+            }
         });
-    });
 }
 
 // ---------------------------------------------------------------- file table
 
 /// Height of one row of the file table.
-const FILE_ROW: f32 = 34.0;
+const FILE_ROW: f32 = 36.0;
 
 /// What a click on one row of the file table asked for.
 enum RowAct {
@@ -3002,19 +3147,6 @@ fn column_row(
 }
 
 // ---------------------------------------------------------------- pieces
-
-/// The grey name at the start of a row of settings, in a column of its own.
-fn row_label(ui: &mut egui::Ui, text: &str, width: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 30.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_width(width);
-            ui.set_min_height(30.0);
-            ui.label(hint(text));
-        },
-    );
-}
 
 /// A value beside a grey label.
 fn kv(ui: &mut egui::Ui, key: &str, value: impl Into<String>) {
