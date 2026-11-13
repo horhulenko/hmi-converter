@@ -1,109 +1,113 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
 <meta charset="utf-8">
 <title>__TITLE__</title>
 <style>
+  @font-face {
+    font-family: "App";
+    font-weight: 400;
+    src: url(data:font/ttf;base64,/*__FONT_REGULAR__*/) format("truetype");
+  }
+  @font-face {
+    font-family: "App";
+    font-weight: 700;
+    src: url(data:font/ttf;base64,/*__FONT_BOLD__*/) format("truetype");
+  }
   :root {
-    --bg: #15181d;
-    --card: #1d2128;
-    --edge: #2f353f;
-    --field: #282d36;
-    --text: #e8ebf0;
-    --muted: #9aa3b2;
-    --dim: #5a6270;
-    --accent: #6ea8ff;
-    --accent-fill: #1f5fcc;
-    --ok: #56d194;
-    --warn: #f0be4b;
+    --bg: #111418;
+    --surface: #171b21;
+    --raised: #1f242c;
+    --edge: #2a3039;
+    --text: #e9edf2;
+    --muted: #9aa4b2;
+    --dim: #5d6673;
+    --accent: #0b8ddc;
+    --accent-deep: #082c50;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--bg);
     color: var(--text);
-    font: 14px/1.45 "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+    font: 14px/1.5 "App", "Segoe UI", system-ui, sans-serif;
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
 
   header {
-    padding: 12px 16px 10px;
-    border-bottom: 1px solid var(--edge);
+    padding: 18px 24px 14px;
     display: flex;
     align-items: baseline;
-    gap: 14px;
+    flex-wrap: wrap;
+    column-gap: 16px;
     flex: none;
   }
-  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
-  header .meta { color: var(--muted); font-size: 12px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+  header .meta { color: var(--muted); font-size: 13px; }
 
   .bar {
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--edge);
+    padding: 0 24px 14px;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 20px;
     flex-wrap: wrap;
     flex: none;
   }
-  .seg { display: flex; flex-wrap: wrap; gap: 4px; }
+  .seg {
+    display: flex; flex-wrap: wrap; gap: 2px;
+    background: var(--surface); border-radius: 8px; padding: 3px;
+  }
   .seg button {
-    background: var(--field);
-    color: var(--text);
-    border: 1px solid var(--edge);
+    background: transparent;
+    color: var(--muted);
+    border: 0;
     border-radius: 6px;
-    padding: 6px 11px;
+    padding: 6px 12px;
     font: inherit;
     font-size: 13px;
     cursor: pointer;
-    transition: background .15s, border-color .15s, color .15s;
   }
-  .seg button:hover { background: #333944; border-color: var(--accent); }
-  .seg button[aria-pressed="true"] {
-    background: var(--accent-fill);
-    border-color: var(--accent);
-    color: #fff;
-  }
-  .opt { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
-  .opt input { accent-color: var(--accent); }
+  .seg button:hover { color: var(--text); background: var(--raised); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .opt { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .opt input { accent-color: var(--accent); margin: 0; }
   select {
-    background: var(--field); color: var(--text); border: 1px solid var(--edge);
-    border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 13px; max-width: 220px;
+    background: var(--raised); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px;
   }
 
-  .body { flex: 1; display: flex; min-height: 0; }
+  .body { flex: 1; display: flex; min-height: 0; border-top: 1px solid var(--edge); }
   aside {
-    width: 288px; flex: none; border-right: 1px solid var(--edge);
-    display: flex; flex-direction: column; min-height: 0;
+    width: 300px; flex: none; border-right: 1px solid var(--edge);
+    display: flex; flex-direction: column; min-height: 0; background: var(--surface);
   }
-  .side-top { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; flex: none; }
+  .side-top { padding: 14px 14px 8px; display: flex; flex-direction: column; gap: 10px; flex: none; }
   #search {
-    background: #111418; color: var(--text); border: 1px solid var(--edge);
-    border-radius: 6px; padding: 7px 9px; font: inherit;
+    background: var(--bg); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 7px 10px; font: inherit;
   }
+  #search:focus { outline: none; border-color: var(--accent); }
   #search::placeholder { color: var(--dim); }
-  .side-row { display: flex; align-items: center; gap: 6px; }
+  .side-row { display: flex; align-items: center; gap: 4px; }
   .side-row button {
-    background: var(--field); color: var(--text); border: 1px solid var(--edge);
-    border-radius: 6px; padding: 4px 9px; font: inherit; font-size: 12px; cursor: pointer;
+    background: transparent; color: var(--muted); border: 0;
+    border-radius: 6px; padding: 4px 8px; font: inherit; font-size: 13px; cursor: pointer;
   }
-  .side-row button:hover { border-color: var(--accent); }
-  .side-row .count { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .side-row button:hover { color: var(--text); background: var(--raised); }
+  .side-row .count { color: var(--dim); font-size: 13px; margin-left: auto; }
 
-  #list { overflow-y: auto; padding: 0 6px 10px; flex: 1; min-height: 0; }
+  #list { overflow-y: auto; padding: 0 8px 12px; flex: 1; min-height: 0; }
   .item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 5px 6px; border-radius: 5px; cursor: pointer;
-    transition: background .12s;
+    display: flex; align-items: flex-start; gap: 9px;
+    padding: 5px 6px; border-radius: 6px; cursor: pointer;
   }
-  .item:hover { background: #232832; }
-  .item input { accent-color: var(--accent); flex: none; }
-  .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
-  .item span.name {
-    font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
+  .item:hover { background: var(--raised); }
+  .item input { accent-color: var(--accent); flex: none; margin: 3px 0 0; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; margin-top: 5px; }
+  .item span.name { font-size: 13px; overflow-wrap: anywhere; }
   .item.off span.name { color: var(--dim); }
   .item.off .swatch { opacity: .3; }
 
@@ -113,9 +117,22 @@
     position: absolute; inset: 0; display: none;
     align-items: center; justify-content: center; color: var(--muted);
   }
+  #tip {
+    position: absolute; left: 0; top: 0; pointer-events: none; z-index: 5;
+    background: rgba(23, 27, 33, .97); border: 1px solid var(--edge); border-radius: 8px;
+    padding: 10px 12px; font-size: 12.5px; min-width: 220px; max-width: 460px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+  }
+  #tip .when { color: var(--muted); margin-bottom: 6px; }
+  #tip .row { display: flex; gap: 10px; align-items: baseline; }
+  #tip .row i { width: 9px; height: 9px; border-radius: 2px; flex: none; align-self: center; }
+  #tip .row span { flex: 1; overflow-wrap: anywhere; }
+  #tip .row em { color: var(--dim); font-style: normal; margin-left: 6px; white-space: nowrap; }
+  #tip .row b { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #tip .more { color: var(--dim); margin-top: 4px; }
   footer {
-    flex: none; padding: 6px 16px; border-top: 1px solid var(--edge);
-    color: var(--dim); font-size: 11.5px;
+    flex: none; padding: 8px 24px; border-top: 1px solid var(--edge);
+    color: var(--dim); font-size: 12px;
   }
 </style>
 </head>
@@ -127,26 +144,26 @@
 
 <div class="bar">
   <div class="seg" id="types"></div>
-  <label class="opt"><input type="checkbox" id="log"> Log scale</label>
-  <label class="opt"><input type="checkbox" id="norm"> Normalise 0-100%</label>
-  <label class="opt"><input type="checkbox" id="smooth"> Smooth</label>
+  <label class="opt"><input type="checkbox" id="log"> Logarithmisch</label>
+  <label class="opt"><input type="checkbox" id="norm"> Normiert 0–100 %</label>
+  <label class="opt"><input type="checkbox" id="smooth"> Geglättet</label>
   <span class="opt" id="xy" hidden>
     X <select id="xsel"></select>
     Y <select id="ysel"></select>
   </span>
   <span class="opt" id="binsWrap" hidden>
-    Buckets <select id="bins"><option>10</option><option selected>20</option><option>40</option><option>80</option></select>
+    Klassen <select id="bins"><option>10</option><option selected>20</option><option>40</option><option>80</option></select>
   </span>
 </div>
 
 <div class="body">
   <aside>
     <div class="side-top">
-      <input id="search" placeholder="filter tags..." autocomplete="off">
+      <input id="search" placeholder="Tags filtern …" autocomplete="off">
       <div class="side-row">
-        <button id="all">All</button>
-        <button id="none">None</button>
-        <button id="invert">Invert</button>
+        <button id="all">Alle</button>
+        <button id="none">Keine</button>
+        <button id="invert">Umkehren</button>
         <span class="count" id="count"></span>
       </div>
     </div>
@@ -154,7 +171,8 @@
   </aside>
   <main>
     <div id="chart"></div>
-    <div id="empty">Pick at least one tag on the left.</div>
+    <div id="tip" hidden></div>
+    <div id="empty">Links mindestens einen Tag auswählen.</div>
   </main>
 </div>
 
@@ -165,6 +183,10 @@
 const PAYLOAD = /*__PAYLOAD__*/;
 
 // ---------------------------------------------------------------- setup
+
+const ACCENT = '#0b8ddc';
+const ACCENT_DEEP = '#082c50';
+const FONT = '"App", "Segoe UI", system-ui, sans-serif';
 
 const S = PAYLOAD.series;
 // A spread of hues, so a hundred tags still tell each other apart.
@@ -177,18 +199,20 @@ const colours = S.map((_, i) => {
 });
 
 const TYPES = [
-  ['line',    'Lines'],
-  ['area',    'Area'],
-  ['stack',   'Stacked'],
-  ['step',    'Steps'],
-  ['scatter', 'Scatter'],
-  ['bar',     'Bars'],
-  ['multi',   'Small multiples'],
+  ['line',    'Linien'],
+  ['area',    'Fläche'],
+  ['stack',   'Gestapelt'],
+  ['step',    'Stufen'],
+  ['scatter', 'Punkte'],
+  ['bar',     'Balken'],
+  ['multi',   'Einzeln'],
   ['heat',    'Heatmap'],
-  ['hist',    'Histogram'],
-  ['box',     'Box plot'],
-  ['xy',      'Correlation'],
+  ['hist',    'Histogramm'],
+  ['box',     'Boxplot'],
+  ['xy',      'Korrelation'],
 ];
+/** The kinds drawn against one shared time axis. */
+const OVER_TIME = ['line', 'area', 'stack', 'step', 'scatter', 'bar'];
 
 const state = {
   type: 'line',
@@ -215,6 +239,20 @@ addEventListener('resize', () => chart.resize());
 
 document.getElementById('meta').textContent = PAYLOAD.meta;
 document.getElementById('foot').textContent = PAYLOAD.foot;
+
+// ---------------------------------------------------------------- numbers
+
+const fmtWhole = new Intl.NumberFormat('de-DE', { maximumFractionDigits: 3 });
+const fmtSmall = new Intl.NumberFormat('de-DE', { maximumSignificantDigits: 3 });
+/** A value as it is read aloud: `0,009`, `1,392`, `1.234,5` -- never `9e-3`. */
+const num = v => (v !== 0 && Math.abs(v) < 1) ? fmtSmall.format(v) : fmtWhole.format(v);
+
+function stamp(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
 
 // ---------------------------------------------------------------- controls
 
@@ -253,7 +291,7 @@ function syncControls() {
   document.getElementById('binsWrap').hidden = !(t === 'hist' || t === 'heat');
   // Normalising only means something when series share one axis.
   document.getElementById('norm').parentElement.style.opacity =
-    ['line', 'area', 'stack', 'step', 'bar', 'multi'].includes(t) ? 1 : .4;
+    [...OVER_TIME, 'multi'].includes(t) ? 1 : .4;
 }
 
 // ---------------------------------------------------------------- tag list
@@ -271,7 +309,7 @@ const items = S.map((s, i) => {
   const name = document.createElement('span');
   name.className = 'name';
   name.textContent = s.name;
-  name.title = `${s.name} - ${s.data.length} points`;
+  name.title = `${s.name} – ${fmtWhole.format(s.data.length)} Punkte`;
   row.append(box, dot, name);
   box.onchange = () => {
     if (box.checked) state.on.add(i); else state.on.delete(i);
@@ -285,7 +323,7 @@ const items = S.map((s, i) => {
 });
 
 function updateCount() {
-  document.getElementById('count').textContent = `${state.on.size} of ${S.length}`;
+  document.getElementById('count').textContent = `${state.on.size} von ${S.length}`;
 }
 
 function setAll(fn) {
@@ -326,94 +364,134 @@ function points(i) {
   return d;
 }
 
-const axisLabel = { color: '#9aa3b2', fontSize: 11 };
-const axisLine = { lineStyle: { color: '#2f353f' } };
-const splitLine = { lineStyle: { color: '#232830' } };
+const axisLabel = { color: '#9aa4b2', fontSize: 11, fontFamily: FONT };
+const valueLabel = { ...axisLabel, formatter: v => num(v) };
+/** German dates on the time axis: `07.10.` at midnight, `14:00` in between. */
+const timeLabel = {
+  ...axisLabel,
+  hideOverlap: true,
+  formatter: {
+    year: '{yyyy}', month: '{MM}.{yyyy}', day: '{dd}.{MM}.',
+    hour: '{HH}:{mm}', minute: '{HH}:{mm}', second: '{HH}:{mm}:{ss}',
+    millisecond: '{HH}:{mm}:{ss},{SSS}', none: '{HH}:{mm}:{ss}',
+  },
+};
+const axisLine = { lineStyle: { color: '#2a3039' } };
+const splitLine = { lineStyle: { color: '#1f242c' } };
 
 function baseGrid(extra) {
-  return Object.assign({ left: 62, right: 24, top: 18, bottom: 72, containLabel: false }, extra);
+  return Object.assign({ left: 72, right: 28, top: 22, bottom: 76, containLabel: false }, extra);
 }
 
 const zoom = [
-  { type: 'inside', throttle: 40 },
+  { type: 'inside', throttle: 30 },
   {
-    type: 'slider', height: 22, bottom: 14, showDetail: false,
-    backgroundColor: '#1a1e24', borderColor: '#2f353f',
-    fillerColor: 'rgba(31,95,204,.25)', handleStyle: { color: '#6ea8ff' },
-    textStyle: { color: '#9aa3b2', fontSize: 10 },
-    dataBackground: { lineStyle: { color: '#3a4250' }, areaStyle: { color: '#232830' } },
+    type: 'slider', height: 24, bottom: 16, showDetail: false,
+    backgroundColor: '#171b21', borderColor: '#2a3039',
+    fillerColor: 'rgba(11,141,220,.18)',
+    handleStyle: { color: ACCENT, borderColor: ACCENT },
+    moveHandleStyle: { color: ACCENT_DEEP },
+    textStyle: { color: '#9aa4b2', fontSize: 11 },
+    dataBackground: { lineStyle: { color: '#3a4250' }, areaStyle: { color: '#1f242c' } },
+    selectedDataBackground: { lineStyle: { color: ACCENT }, areaStyle: { color: ACCENT_DEEP } },
   },
 ];
 
 const tooltipBox = {
-  backgroundColor: 'rgba(24,28,34,.96)',
-  borderColor: '#2f353f',
-  textStyle: { color: '#e8ebf0', fontSize: 12 },
-  extraCssText: 'max-height:60vh;overflow:auto;box-shadow:0 6px 24px rgba(0,0,0,.45)',
+  backgroundColor: 'rgba(23,27,33,.97)',
+  borderColor: '#2a3039',
+  textStyle: { color: '#e9edf2', fontSize: 12, fontFamily: FONT },
+  extraCssText: 'max-height:60vh;overflow:auto;box-shadow:0 8px 28px rgba(0,0,0,.45)',
 };
 
-function stamp(ms) {
-  const d = new Date(ms);
-  const p = n => String(n).padStart(2, '0');
-  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} ` +
-         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
-}
-
-const num = v => (Math.abs(v) >= 1000 || v === 0 || Math.abs(v) >= 0.01)
-  ? (+v.toFixed(3)).toLocaleString('en-GB')
-  : v.toExponential(2);
-
-/** What is on the chart right now, so the tooltip reads the same numbers. */
+/** What is on the chart right now, so the readout uses the same numbers. */
 const DRAWN = new Map();
 
 /** The last reading of a series at or before `t`.
  *
  *  The tags do not log in step with each other, so asking for "the value at
  *  this instant" means the reading that still stands -- which is what the HMI
- *  itself holds between entries. */
-function valueAt(points, t) {
-  if (!points || !points.length || t < points[0][0]) return null;
-  let lo = 0, hi = points.length - 1;
+ *  itself holds between entries. A binary search, so the readout keeps up
+ *  with the mouse however many points there are. */
+function valueAt(pts, t) {
+  if (!pts || !pts.length || t < pts[0][0]) return null;
+  let lo = 0, hi = pts.length - 1;
   while (lo < hi) {
     const mid = (lo + hi + 1) >> 1;
-    if (points[mid][0] <= t) lo = mid; else hi = mid - 1;
+    if (pts[mid][0] <= t) lo = mid; else hi = mid - 1;
   }
-  return points[lo];
+  return pts[lo];
 }
 
-/** The shared tooltip: every chosen tag at the instant under the pointer,
- *  largest first, the way a trend viewer reads one. */
-const timeTooltip = {
-  trigger: 'axis',
-  axisPointer: { type: 'cross', lineStyle: { color: '#6ea8ff', width: 1 },
-                 crossStyle: { color: '#6ea8ff' }, label: { backgroundColor: '#1f5fcc' } },
-  ...tooltipBox,
-  formatter(ps) {
-    if (!ps.length) return '';
-    const t = ps[0].axisValue != null ? +ps[0].axisValue : ps[0].value[0];
+// ---------------------------------------------------------------- readout
+//
+// The crosshair follows the mouse exactly. ECharts' own axis tooltip snaps to
+// the nearest data point of some series -- with tags that log rarely that is
+// far from the pointer, and finding it scans every point on every move. So
+// the pointer lines are drawn without snapping, and the list of values beside
+// them is built here from the time under the mouse.
 
-    const found = [];
-    for (const i of chosen()) {
-      const hit = valueAt(DRAWN.get(i), t);
-      if (hit) found.push({ i, v: hit[1], at: hit[0] });
-    }
-    found.sort((a, b) => b.v - a.v);
+const tip = document.getElementById('tip');
+let pointer = null;
+let frame = 0;
 
-    const LIMIT = 24;
-    const rows = found.slice(0, LIMIT).map(f => {
-      // A reading much older than the pointer is one that still stands.
-      const held = t - f.at > 60000 ? ' <span style="color:#5a6270">held</span>' : '';
-      return `<div style="display:flex;gap:10px;align-items:center">
-        <span style="width:9px;height:9px;border-radius:2px;background:${colours[f.i]}"></span>
-        <span style="flex:1">${S[f.i].name}${held}</span>
-        <b style="font-variant-numeric:tabular-nums">${num(f.v)}</b></div>`;
-    }).join('');
-    const more = found.length > LIMIT
-      ? `<div style="color:#5a6270;margin-top:3px">and ${found.length - LIMIT} more</div>` : '';
+function readoutHtml(t) {
+  const found = [];
+  for (const i of chosen()) {
+    const hit = valueAt(DRAWN.get(i), t);
+    if (hit) found.push({ i, v: hit[1], at: hit[0] });
+  }
+  if (!found.length) return '';
+  found.sort((a, b) => b.v - a.v);
 
-    return `<div style="margin-bottom:4px;color:#9aa3b2">${stamp(t)}</div>${rows}${more}`;
-  },
-};
+  const LIMIT = 24;
+  const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const rows = found.slice(0, LIMIT).map(f => {
+    // A reading much older than the pointer is one that still stands.
+    const held = t - f.at > 60000 ? '<em>gehalten</em>' : '';
+    return `<div class="row"><i style="background:${colours[f.i]}"></i>` +
+      `<span>${esc(S[f.i].name)}${held}</span><b>${num(f.v)}</b></div>`;
+  }).join('');
+  const more = found.length > LIMIT
+    ? `<div class="more">und ${found.length - LIMIT} weitere</div>` : '';
+  return `<div class="when">${stamp(t)}</div>${rows}${more}`;
+}
+
+function drawReadout() {
+  frame = 0;
+  const live = pointer && OVER_TIME.includes(state.type) && state.on.size &&
+    chart.containPixel({ gridIndex: 0 }, pointer);
+  if (!live) { tip.hidden = true; return; }
+  const t = chart.convertFromPixel({ xAxisIndex: 0 }, pointer[0]);
+  const html = readoutHtml(t);
+  if (!html) { tip.hidden = true; return; }
+  tip.innerHTML = html;
+  tip.hidden = false;
+
+  // Beside the pointer, on whichever side has room.
+  const box = tip.parentElement.getBoundingClientRect();
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = pointer[0] + 18;
+  if (x + w > box.width - 8) x = pointer[0] - w - 18;
+  let y = pointer[1] + 18;
+  if (y + h > box.height - 8) y = Math.max(8, box.height - h - 8);
+  tip.style.transform = `translate(${Math.max(8, x)}px, ${y}px)`;
+}
+
+chart.getZr().on('mousemove', e => {
+  pointer = [e.offsetX, e.offsetY];
+  if (!frame) frame = requestAnimationFrame(drawReadout);
+});
+chart.getZr().on('globalout', () => { pointer = null; tip.hidden = true; });
+chart.on('dataZoom', () => { if (pointer && !frame) frame = requestAnimationFrame(drawReadout); });
+
+/** Pointer lines that sit exactly under the mouse. */
+const freePointer = (label) => ({
+  show: true, snap: false, triggerTooltip: false, type: 'line',
+  lineStyle: { color: ACCENT, width: 1, type: 'solid', opacity: .8 },
+  label: { show: true, backgroundColor: ACCENT, color: '#fff', fontFamily: FONT,
+           fontSize: 11, padding: [4, 7], borderRadius: 4, formatter: label },
+});
 
 // ---------------------------------------------------------------- the charts
 
@@ -425,16 +503,21 @@ function optionTime() {
   const isScatter = state.type === 'scatter';
   const isBar = state.type === 'bar';
   return {
-    animationDuration: 420,
+    animationDuration: 380,
     animationEasing: 'cubicOut',
     grid: baseGrid(),
-    tooltip: timeTooltip,
-    xAxis: { type: 'time', axisLabel, axisLine, splitLine: { show: false } },
+    tooltip: { show: true, trigger: 'none', showContent: false },
+    xAxis: {
+      type: 'time', axisLabel: timeLabel, axisLine, splitLine: { show: false },
+      axisPointer: freePointer(p => stamp(p.value)),
+    },
     yAxis: {
       type: state.log ? 'log' : 'value',
       name: state.norm ? '%' : '',
-      nameTextStyle: { color: '#9aa3b2' },
-      axisLabel, axisLine, splitLine, scale: !state.log,
+      nameTextStyle: { color: '#9aa4b2' },
+      axisLabel: valueLabel, axisLine, splitLine, scale: !state.log,
+      axisPointer: { ...freePointer(p => num(p.value)),
+                     lineStyle: { color: ACCENT, width: 1, type: 'dashed', opacity: .5 } },
     },
     dataZoom: zoom,
     series: ids.map(i => ({
@@ -454,7 +537,7 @@ function optionTime() {
       large: true,
       largeThreshold: 2000,
       sampling: 'lttb',
-      emphasis: { focus: 'series', lineStyle: { width: 2.6 } },
+      silent: true,
     })),
   };
 }
@@ -477,17 +560,16 @@ function optionMultiples() {
     titles.push({
       text: S[id].name, left: `${padX + c * (100 - padX * 2) / cols}%`,
       top: `${6 + r * (94 / rows) - 4.2}%`,
-      textStyle: { color: colours[id], fontSize: 11, fontWeight: 500 },
+      textStyle: { color: colours[id], fontSize: 11, fontWeight: 400, fontFamily: FONT },
     });
     xAxis.push({
       type: 'time', gridIndex: k, splitNumber: 2,
-      axisLabel: { ...axisLabel, fontSize: 9, hideOverlap: true, showMinLabel: false,
-                   showMaxLabel: false },
+      axisLabel: { ...timeLabel, fontSize: 9, showMinLabel: false, showMaxLabel: false },
       axisLine, splitLine: { show: false },
     });
     yAxis.push({
       type: state.log ? 'log' : 'value', gridIndex: k, scale: !state.log, splitNumber: 3,
-      axisLabel: { ...axisLabel, fontSize: 9, hideOverlap: true }, axisLine, splitLine,
+      axisLabel: { ...valueLabel, fontSize: 9, hideOverlap: true }, axisLine, splitLine,
     });
     series.push({
       id: 'm' + id, name: S[id].name, type: 'line', xAxisIndex: k, yAxisIndex: k,
@@ -497,11 +579,12 @@ function optionMultiples() {
     });
   });
   return {
-    animationDuration: 380,
+    animationDuration: 340,
     title: titles,
     tooltip: { trigger: 'axis', ...tooltipBox,
+      axisPointer: { lineStyle: { color: ACCENT } },
       formatter: ps => ps.length
-        ? `<div style="color:#9aa3b2">${stamp(ps[0].value[0])}</div>
+        ? `<div style="color:#9aa4b2">${stamp(ps[0].value[0])}</div>
            ${ps[0].marker} ${ps[0].seriesName} <b>${num(ps[0].value[1])}</b>` : '' },
     grid, xAxis, yAxis, series,
   };
@@ -536,13 +619,13 @@ function optionHeat() {
     }
   });
   return {
-    animationDuration: 380,
-    grid: baseGrid({ left: 190, bottom: 78, top: 14 }),
+    animationDuration: 340,
+    grid: baseGrid({ left: 220, bottom: 80, top: 16 }),
     tooltip: {
       ...tooltipBox,
-      formatter: p => `<div style="color:#9aa3b2">${stamp(t0 + p.value[0] * width)}</div>
+      formatter: p => `<div style="color:#9aa4b2">${stamp(t0 + p.value[0] * width)}</div>
         ${S[ids[p.value[1]]].name} <b>${num(p.value[3])}</b>
-        <div style="color:#9aa3b2">${p.value[2].toFixed(0)}% of this tag's range</div>`,
+        <div style="color:#9aa4b2">${p.value[2].toFixed(0)} % des Bereichs dieses Tags</div>`,
     },
     xAxis: {
       type: 'category', data: Array.from({ length: buckets }, (_, b) => t0 + b * width),
@@ -555,8 +638,8 @@ function optionHeat() {
     },
     visualMap: {
       min: 0, max: 100, calculable: true, orient: 'horizontal',
-      left: 'center', bottom: 12, textStyle: { color: '#9aa3b2' },
-      inRange: { color: ['#1b2a4a', '#1f5fcc', '#56d194', '#f0be4b', '#f27b7b'] },
+      left: 'center', bottom: 12, textStyle: { color: '#9aa4b2' },
+      inRange: { color: ['#111418', ACCENT_DEEP, ACCENT, '#bfe6ff'] },
     },
     series: [{ type: 'heatmap', data, progressive: 4000,
                emphasis: { itemStyle: { borderColor: '#fff', borderWidth: 1 } } }],
@@ -569,7 +652,8 @@ function optionHist() {
   const bins = state.bins;
   const series = ids.map(id => {
     const vs = S[id].data.map(p => p[1]);
-    let lo = Math.min(...vs), hi = Math.max(...vs);
+    let lo = Infinity, hi = -Infinity;
+    for (const v of vs) { if (v < lo) lo = v; if (v > hi) hi = v; }
     if (lo === hi) { lo -= .5; hi += .5; }
     const w = (hi - lo) / bins;
     const counts = new Array(bins).fill(0);
@@ -582,15 +666,15 @@ function optionHist() {
     };
   });
   return {
-    animationDuration: 420,
-    grid: baseGrid({ bottom: 44 }),
+    animationDuration: 380,
+    grid: baseGrid({ bottom: 48 }),
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, ...tooltipBox,
       formatter: ps => ps.map(p =>
-        `${p.marker} ${p.seriesName} around <b>${num(p.value[0])}</b>: ${p.value[1]}`).join('<br>') },
-    xAxis: { type: 'value', name: 'value', nameTextStyle: { color: '#9aa3b2' },
-             axisLabel, axisLine, splitLine: { show: false }, scale: true },
-    yAxis: { type: state.log ? 'log' : 'value', name: 'count',
-             nameTextStyle: { color: '#9aa3b2' }, axisLabel, axisLine, splitLine },
+        `${p.marker} ${p.seriesName} um <b>${num(p.value[0])}</b>: ${fmtWhole.format(p.value[1])}`).join('<br>') },
+    xAxis: { type: 'value', name: 'Wert', nameTextStyle: { color: '#9aa4b2' },
+             axisLabel: valueLabel, axisLine, splitLine: { show: false }, scale: true },
+    yAxis: { type: state.log ? 'log' : 'value', name: 'Anzahl',
+             nameTextStyle: { color: '#9aa4b2' }, axisLabel: valueLabel, axisLine, splitLine },
     series,
   };
 }
@@ -607,20 +691,20 @@ function optionBox() {
   };
   const data = ids.map(id => quart(S[id].data.map(p => p[1]).sort((a, b) => a - b)));
   return {
-    animationDuration: 420,
-    grid: baseGrid({ bottom: 120 }),
+    animationDuration: 380,
+    grid: baseGrid({ bottom: 130 }),
     tooltip: { trigger: 'item', ...tooltipBox,
       formatter: p => `<b>${S[ids[p.dataIndex]].name}</b><br>
-        lowest ${num(p.value[1])}<br>lower quarter ${num(p.value[2])}<br>
-        middle ${num(p.value[3])}<br>upper quarter ${num(p.value[4])}<br>
-        highest ${num(p.value[5])}` },
+        Minimum ${num(p.value[1])}<br>unteres Quartil ${num(p.value[2])}<br>
+        Median ${num(p.value[3])}<br>oberes Quartil ${num(p.value[4])}<br>
+        Maximum ${num(p.value[5])}` },
     xAxis: { type: 'category', data: ids.map(i => S[i].name),
              axisLabel: { ...axisLabel, rotate: 38, fontSize: 10 }, axisLine },
     yAxis: { type: state.log ? 'log' : 'value', scale: !state.log,
-             axisLabel, axisLine, splitLine },
+             axisLabel: valueLabel, axisLine, splitLine },
     series: [{ type: 'boxplot', data,
-               itemStyle: { color: '#1f5fcc55', borderColor: '#6ea8ff' },
-               emphasis: { itemStyle: { borderColor: '#56d194' } } }],
+               itemStyle: { color: 'rgba(11,141,220,.25)', borderColor: ACCENT },
+               emphasis: { itemStyle: { borderColor: '#fff' } } }],
   };
 }
 
@@ -635,22 +719,22 @@ function optionXY() {
     if (b.data[j]) pairs.push([va, b.data[j][1], t]);
   }
   return {
-    animationDuration: 420,
-    grid: baseGrid({ bottom: 92 }),
+    animationDuration: 380,
+    grid: baseGrid({ bottom: 96, left: 84 }),
     tooltip: { trigger: 'item', ...tooltipBox,
-      formatter: p => `<div style="color:#9aa3b2">${stamp(p.value[2])}</div>
+      formatter: p => `<div style="color:#9aa4b2">${stamp(p.value[2])}</div>
         ${a.name} <b>${num(p.value[0])}</b><br>${b.name} <b>${num(p.value[1])}</b>` },
     xAxis: { type: state.log ? 'log' : 'value', name: a.name, nameLocation: 'middle',
-             nameGap: 30, nameTextStyle: { color: '#9aa3b2' },
-             axisLabel, axisLine, splitLine, scale: true },
+             nameGap: 30, nameTextStyle: { color: '#9aa4b2' },
+             axisLabel: valueLabel, axisLine, splitLine, scale: true },
     yAxis: { type: state.log ? 'log' : 'value', name: b.name, nameLocation: 'middle',
-             nameGap: 44, nameTextStyle: { color: '#9aa3b2' },
-             axisLabel, axisLine, splitLine, scale: true },
+             nameGap: 56, nameTextStyle: { color: '#9aa4b2' },
+             axisLabel: valueLabel, axisLine, splitLine, scale: true },
     visualMap: {
       dimension: 2, min: PAYLOAD.from, max: PAYLOAD.to, calculable: true,
       orient: 'horizontal', left: 'center', bottom: 10, precision: 0,
-      text: ['later', 'earlier'], textStyle: { color: '#9aa3b2' },
-      inRange: { color: ['#1f5fcc', '#56d194', '#f0be4b'] },
+      text: ['später', 'früher'], textStyle: { color: '#9aa4b2' },
+      inRange: { color: [ACCENT_DEEP, ACCENT, '#bfe6ff'] },
       formatter: v => stamp(v).slice(11, 16),
     },
     series: [{ type: 'scatter', data: pairs, symbolSize: 5,
@@ -665,6 +749,7 @@ function render(hard) {
   const needsTags = state.type !== 'xy';
   document.getElementById('empty').style.display =
     (needsTags && ids.length === 0) ? 'flex' : 'none';
+  tip.hidden = true;
   if (needsTags && ids.length === 0) { chart.clear(); return; }
 
   let option;
@@ -677,12 +762,19 @@ function render(hard) {
     default:      option = optionTime();
   }
   option.useUTC = true;
-  chart.setOption(option, { notMerge: !!hard, lazyUpdate: false });
+  option.textStyle = { fontFamily: FONT };
+  // A softer update keeps the zoom, but the series list is still replaced,
+  // so a tag switched off really leaves the chart.
+  chart.setOption(option, hard
+    ? { notMerge: true }
+    : { replaceMerge: ['series', 'title', 'grid', 'xAxis', 'yAxis'] });
 }
 
 updateCount();
 syncControls();
-render(true);
+// The canvas measures its text once, so the font has to be there first.
+const ready = document.fonts ? document.fonts.load('12px "App"') : Promise.resolve();
+ready.catch(() => {}).then(() => render(true));
 </script>
 </body>
 </html>

@@ -19,6 +19,9 @@ use crate::convert::{self, Progress, Windows};
 const ECHARTS: &str = include_str!("../assets/echarts.min.js");
 /// The page around it.
 const TEMPLATE: &str = include_str!("../assets/chart.html");
+/// The window's own font, written into the page so the two look alike offline.
+const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/NotoSans-Regular.ttf");
+const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/NotoSans-Bold.ttf");
 
 /// Windows FILETIME ticks -> milliseconds since 1970, which is what the time
 /// axis of the chart expects.
@@ -49,17 +52,17 @@ impl Detail {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Full => "Full",
-            Self::Balanced => "Balanced",
-            Self::Light => "Light",
+            Self::Full => "Voll",
+            Self::Balanced => "Ausgewogen",
+            Self::Light => "Leicht",
         }
     }
 
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Full => "every point, largest file",
-            Self::Balanced => "up to 4000 points per tag",
-            Self::Light => "up to 1000 points per tag",
+            Self::Full => "Jeder Messpunkt, größte Datei",
+            Self::Balanced => "Bis zu 4000 Punkte je Tag",
+            Self::Light => "Bis zu 1000 Punkte je Tag",
         }
     }
 }
@@ -181,11 +184,11 @@ pub fn load(
     };
 
     if job.value_dbs.is_empty() {
-        return Err("no database with logged values was chosen".into());
+        return Err("Keine Datenbank mit Messwerten ausgewählt".into());
     }
 
     // -- names -------------------------------------------------------------
-    say("Reading tag names");
+    say("Tag-Namen lesen");
     let listed = convert::read_all_tag_names(&job.tag_dbs)?;
     let names = if job.shorten_names {
         convert::shorten_tag_names(&listed)
@@ -241,17 +244,17 @@ pub fn load(
         plan.push((db.clone(), numeric));
     }
     if plan.iter().all(|(_, n)| n.is_empty()) {
-        return Err("the chosen databases hold no numeric values to plot".into());
+        return Err("Die gewählten Datenbanken enthalten keine Zahlenwerte zum Darstellen".into());
     }
     if total == 0 {
-        return Err("no values to plot in the chosen time range".into());
+        return Err("Im gewählten Zeitraum gibt es keine Werte zum Darstellen".into());
     }
 
     for (db, numeric) in &plan {
         if numeric.is_empty() {
             continue;
         }
-        say(&format!("Reading {}", convert::short_name(db)));
+        say(&format!("{} lesen", convert::short_name(db)));
         let conn = convert::open_readonly(db)?;
         // Grouped by tag, so each tag's points arrive in one run and in order.
         let sql = numeric
@@ -298,7 +301,7 @@ pub fn load(
     let _ = tx.send(Progress::Rows { done: read, total });
 
     if points.is_empty() {
-        return Err("no numeric values to plot".into());
+        return Err("Keine Zahlenwerte zum Darstellen".into());
     }
 
     // Tag numbers, so the series are in the same order whatever the files.
@@ -323,7 +326,7 @@ pub fn load(
     let skipped_text = text_ids.len();
 
     // -- thin it out -------------------------------------------------------
-    say("Preparing the chart");
+    say("Diagramm vorbereiten");
     if let Some(cap) = job.detail.cap() {
         for s in &mut series {
             if s.points.len() > cap {
@@ -359,7 +362,7 @@ pub fn build(
         last_ms,
     } = load(job, tx, cancel)?;
 
-    let _ = tx.send(Progress::Stage("Writing the page".into()));
+    let _ = tx.send(Progress::Stage("Seite schreiben".into()));
     let mut payload = String::with_capacity(drawn as usize * 18 + 1024);
     payload.push_str("{\"from\":");
     payload.push_str(&first_ms.to_string());
@@ -368,22 +371,22 @@ pub fn build(
 
     payload.push_str(",\"meta\":");
     let span = format!(
-        "{}  to  {}",
+        "{} – {}",
         convert::filetime_to_short(convert::ms_to_ticks(first_ms)),
         convert::filetime_to_short(convert::ms_to_ticks(last_ms))
     );
-    json_string(&mut payload, &format!("{} tags   {span}", series.len()));
+    json_string(&mut payload, &format!("{} Tags · {span}", series.len()));
 
     payload.push_str(",\"foot\":");
     let foot = format!(
-        "{} of {} points drawn ({}) - {} - built by HMI Log Converter, \
-         charts by Apache ECharts, all offline",
-        drawn,
-        read,
+        "{} von {} Punkten dargestellt ({}) · {} · erstellt mit HMI Log Converter, \
+         Diagramme von Apache ECharts, vollständig offline",
+        crate::sep(drawn),
+        crate::sep(read),
         job.detail.label(),
         match job.value_dbs.as_slice() {
             [one] => convert::short_name(one),
-            many => format!("{} databases", many.len()),
+            many => format!("{} Datenbanken", many.len()),
         },
     );
     json_string(&mut payload, &foot);
@@ -410,15 +413,17 @@ pub fn build(
     }
     payload.push_str("]}");
 
-    let title = format!("{} - HMI log", job.base_name);
+    let title = format!("{} – HMI-Protokoll", job.base_name);
     let page = TEMPLATE
+        .replace("/*__FONT_REGULAR__*/", &base64(FONT_REGULAR))
+        .replace("/*__FONT_BOLD__*/", &base64(FONT_BOLD))
         .replace("__TITLE__", &html_escape(&title))
         .replace("/*__ECHARTS__*/", ECHARTS)
         .replace("/*__PAYLOAD__*/", &payload);
 
-    fs::create_dir_all(&job.out_dir).map_err(|e| format!("cannot create output folder: {e}"))?;
+    fs::create_dir_all(&job.out_dir).map_err(|e| format!("Ausgabeordner kann nicht angelegt werden: {e}"))?;
     let path = job.out_dir.join(format!("{}_chart.html", job.base_name));
-    fs::write(&path, &page).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    fs::write(&path, &page).map_err(|e| format!("{} kann nicht geschrieben werden: {e}", path.display()))?;
 
     Ok(ChartSummary {
         bytes: page.len() as u64,
@@ -447,6 +452,24 @@ fn format_value(v: f64) -> String {
         return trimmed.to_string();
     }
     format!("{v}")
+}
+
+/// Plain base64, for the font inside the page. Small enough not to need a crate.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for k in 0..4 {
+            if k <= chunk.len() {
+                out.push(ABC[((n >> (18 - 6 * k)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn html_escape(s: &str) -> String {
@@ -523,6 +546,15 @@ mod tests {
     }
 
     #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
     fn json_strings_are_escaped() {
         let mut s = String::new();
         json_string(&mut s, r#"a"b\c"#);
@@ -535,6 +567,8 @@ mod tests {
         assert!(ECHARTS.len() > 500_000, "ECharts is not embedded");
         assert!(TEMPLATE.contains("/*__ECHARTS__*/"));
         assert!(TEMPLATE.contains("/*__PAYLOAD__*/"));
+        assert!(TEMPLATE.contains("/*__FONT_REGULAR__*/"));
+        assert!(TEMPLATE.contains("/*__FONT_BOLD__*/"));
         // Nothing may be fetched at view time.
         for remote in ["http://", "https://", "//cdn", "src=\"//"] {
             assert!(

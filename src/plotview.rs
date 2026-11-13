@@ -855,17 +855,29 @@ fn time_label(ms: f64) -> String {
     }
 }
 
+/// A value as it is read aloud, German style: `0,009`, `1,392`, `1235` --
+/// never `9.00e-3`. Below one the digits that matter are kept, however many
+/// noughts come first.
 fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".into()
-    } else if v.abs() >= 1000.0 {
-        format!("{v:.0}")
-    } else if v.abs() >= 0.01 {
-        let s = format!("{v:.3}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        format!("{v:.2e}")
+    if v == 0.0 || !v.is_finite() {
+        return if v == 0.0 { "0".into() } else { v.to_string() };
     }
+    let a = v.abs();
+    let decimals = if a >= 1000.0 {
+        0
+    } else if a >= 1.0 {
+        3
+    } else {
+        // Three significant digits: 0,5 / 0,019 / 0,000123.
+        ((-a.log10()).floor() as usize + 3).clamp(3, 12)
+    };
+    let s = format!("{v:.decimals$}");
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &s
+    };
+    s.replace('.', ",")
 }
 
 /// How much room the cursor readout is allowed, so the tag list keeps the rest.
@@ -916,11 +928,15 @@ mod tests {
     fn values_read_well_at_every_size() {
         assert_eq!(format_value(0.0), "0");
         assert_eq!(format_value(5.0), "5");
-        assert_eq!(format_value(0.5), "0.5");
+        assert_eq!(format_value(0.5), "0,5");
+        assert_eq!(format_value(1.392), "1,392");
+        assert_eq!(format_value(-25.0365), "-25,037");
         assert_eq!(format_value(1234.6), "1235");
-        // Rust rounds a half to the even neighbour, which is fine for an axis.
-        assert_eq!(format_value(1234.5), "1234");
-        assert!(format_value(0.000_001).contains('e'));
+        // Small values are written out, never as 9.00e-3.
+        assert_eq!(format_value(0.009), "0,009");
+        assert_eq!(format_value(0.004), "0,004");
+        assert_eq!(format_value(0.000_123_4), "0,000123");
+        assert!(!format_value(0.000_001).contains('e'));
     }
 
     #[test]
