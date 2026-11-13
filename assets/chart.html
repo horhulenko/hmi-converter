@@ -433,6 +433,9 @@ function valueAt(pts, t) {
 
 const tip = document.getElementById('tip');
 let pointer = null;
+/** The time the crosshair stands at, as ECharts reports it -- so the list
+ *  and the label on the axis always name the same instant. */
+let pointerT = null;
 let frame = 0;
 
 function readoutHtml(t) {
@@ -462,7 +465,7 @@ function drawReadout() {
   const live = pointer && OVER_TIME.includes(state.type) && state.on.size &&
     chart.containPixel({ gridIndex: 0 }, pointer);
   if (!live) { tip.hidden = true; return; }
-  const t = chart.convertFromPixel({ xAxisIndex: 0 }, pointer[0]);
+  const t = pointerT != null ? pointerT : chart.convertFromPixel({ xAxisIndex: 0 }, pointer[0]);
   const html = readoutHtml(t);
   if (!html) { tip.hidden = true; return; }
   tip.innerHTML = html;
@@ -482,7 +485,12 @@ chart.getZr().on('mousemove', e => {
   pointer = [e.offsetX, e.offsetY];
   if (!frame) frame = requestAnimationFrame(drawReadout);
 });
-chart.getZr().on('globalout', () => { pointer = null; tip.hidden = true; });
+chart.getZr().on('globalout', () => { pointer = null; pointerT = null; tip.hidden = true; });
+chart.on('updateAxisPointer', ev => {
+  const x = (ev.axesInfo || []).find(a => a.axisDim === 'x');
+  pointerT = x ? +x.value : null;
+  if (pointer && !frame) frame = requestAnimationFrame(drawReadout);
+});
 chart.on('dataZoom', () => { if (pointer && !frame) frame = requestAnimationFrame(drawReadout); });
 
 /** Pointer lines that sit exactly under the mouse. */
