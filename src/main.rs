@@ -833,8 +833,8 @@ impl App {
     /// A name for the output that says where it came from.
     ///
     /// One file gives its own name. Several give what their names have in
-    /// common -- an HMI numbers its files, so `..._Werte_20260302_053000` and
-    /// `..._Werte_20260303_090000` suggest `Anlage1_Werte`. Failing that,
+    /// common -- an HMI numbers its files, so `Anlage1_Werte_20260302_053000` and
+    /// `Anlage1_Werte_20260303_090000` suggest `Anlage1_Werte`. Failing that,
     /// the folder they sit in.
     fn suggested_name(&self) -> String {
         let stems: Vec<String> = self

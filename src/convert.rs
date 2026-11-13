@@ -405,7 +405,7 @@ const MAX_FILES: usize = 4000;
 
 /// A file SQLite could open, decided by its first bytes rather than its name.
 ///
-/// An HMI export names its databases `..._Werte_20260302_053000.db3`, but
+/// An HMI export names its databases `Anlage1_Werte_20260302_053000.db3`, but
 /// nothing guarantees that, so the header is what is trusted.
 pub fn looks_like_sqlite(path: &Path) -> bool {
     use std::io::Read;
