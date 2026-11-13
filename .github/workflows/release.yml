@@ -54,6 +54,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # Packed, the program is about a third of its size. It unpacks itself
+      # into memory when it starts, which takes a fraction of a second.
+      - name: Pack with UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: target/release/hmi-converter${{ runner.os == 'Windows' && '.exe' || '' }}
+          args: --best --lzma
+
       - name: Package
         shell: bash
         run: |
