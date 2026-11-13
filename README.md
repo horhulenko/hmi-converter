@@ -20,7 +20,7 @@ See the values in a chart.
 - It shows the values in a chart.
 - It does not change your files.
 - It does not use the internet.
-- You do not have to install it.
+- It is one file. It needs no other software.
 
 ## Download
 

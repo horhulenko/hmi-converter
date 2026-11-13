@@ -20,7 +20,7 @@ Zeigt die Werte in einem Diagramm.
 - Es zeigt die Werte in einem Diagramm.
 - Es verändert Ihre Dateien nicht.
 - Es braucht kein Internet.
-- Sie müssen nichts installieren.
+- Es ist eine einzige Datei. Es braucht keine andere Software.
 
 ## Herunterladen
 
