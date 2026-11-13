@@ -122,7 +122,9 @@ pub fn apply(ctx: &egui::Context) {
         v.window_fill = SURFACE;
         v.window_stroke = Stroke::new(1.0, EDGE);
         v.window_corner_radius = CornerRadius::same(10);
-        v.extreme_bg_color = SURFACE; // text input
+        // Text fields are raised, so they show on a panel as well as on the
+        // window, and their edge lines up with the controls around them.
+        v.extreme_bg_color = RAISED;
         v.faint_bg_color = SURFACE;
         v.hyperlink_color = ACCENT_HOVER;
         v.selection.bg_fill = ACCENT_DEEP;
@@ -363,7 +365,7 @@ pub fn segmented<T: PartialEq + Copy>(
     let total = widths.iter().sum::<f32>() + 6.0;
     let (outer, _) = ui.allocate_exact_size(egui::vec2(total, height + 2.0), egui::Sense::hover());
     ui.painter()
-        .rect_filled(outer, CornerRadius::same(RADIUS + 2), SURFACE);
+        .rect_filled(outer, CornerRadius::same(RADIUS + 2), RAISED);
     let mut x = outer.left() + 3.0;
     for ((option, galley), w) in options.iter().zip(galleys).zip(widths) {
         let rect = egui::Rect::from_min_size(
@@ -385,7 +387,7 @@ pub fn segmented<T: PartialEq + Copy>(
                 .rect_filled(rect, CornerRadius::same(RADIUS), ACCENT);
         } else if response.hovered() {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(RADIUS), RAISED);
+                .rect_filled(rect, CornerRadius::same(RADIUS), RAISED_HOVER);
         }
         let colour = if picked {
             ON_ACCENT
@@ -570,22 +572,32 @@ pub fn meter(ui: &mut egui::Ui, fraction: f32, width: f32) {
     }
 }
 
-/// A row of a settings form: the grey name in a column of its own, the
-/// controls beside it, all on one baseline.
+/// A row of a settings form: the grey name in a column of its own, then
+/// whatever `add` lays out -- which should put its first group of controls
+/// in a [`form_cell`], so that every row starts its columns on the same
+/// edges and the form reads as a grid.
 pub fn form_row(ui: &mut egui::Ui, label: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal_wrapped(|ui| {
-        ui.set_min_height(44.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(width, 32.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_width(width);
-                ui.set_min_height(32.0);
-                ui.label(hint(label));
-            },
-        );
+    ui.horizontal(|ui| {
+        ui.set_min_height(46.0);
+        form_cell(ui, width, |ui| {
+            ui.label(hint(label));
+        });
         add(ui);
     });
+}
+
+/// One column of a form row, exactly `width` wide whatever is in it, with
+/// its contents on the row's centre line.
+pub fn form_cell(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 32.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(width);
+            ui.set_min_height(32.0);
+            add(ui);
+        },
+    );
 }
 
 /// Content of `width` at most, centred in what there is: for the screens

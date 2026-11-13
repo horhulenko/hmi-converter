@@ -1995,7 +1995,10 @@ impl App {
             return;
         }
         ui.add_space(theme::GAP + 2.0);
+        // A grid: the names in one column, and the controls in two more
+        // whose left edges are the same on every row.
         const LABEL: f32 = 140.0;
+        const FIRST: f32 = 300.0;
 
         theme::panel()
             .inner_margin(egui::Margin::symmetric(16, 4))
@@ -2005,21 +2008,22 @@ impl App {
 
                 // -- which tables
                 theme::form_row(ui, "Tabellen", LABEL, |ui| {
-                    theme::check(ui, &mut self.write_long, "Lang")
-                        .on_hover_text("Eine Zeile je Messwert");
-                    if self.write_long {
-                        let chosen = self.columns().len();
-                        if theme::quiet(
-                            ui,
-                            &format!("Spalten ({chosen} von {}) …", Column::ALL.len()),
-                        )
-                        .on_hover_text("Spalten auswählen, ordnen und umbenennen")
-                        .clicked()
-                        {
-                            self.columns_open = true;
+                    theme::form_cell(ui, FIRST, |ui| {
+                        theme::check(ui, &mut self.write_long, "Lang")
+                            .on_hover_text("Eine Zeile je Messwert");
+                        if self.write_long {
+                            let chosen = self.columns().len();
+                            if theme::quiet(
+                                ui,
+                                &format!("Spalten ({chosen} von {}) …", Column::ALL.len()),
+                            )
+                            .on_hover_text("Spalten auswählen, ordnen und umbenennen")
+                            .clicked()
+                            {
+                                self.columns_open = true;
+                            }
                         }
-                    }
-                    ui.add_space(18.0);
+                    });
                     theme::check(ui, &mut self.write_wide, "Breit")
                         .on_hover_text("Eine Zeile je Zeitpunkt, eine Spalte je Tag");
                     if !self.write_long && !self.write_wide {
@@ -2031,44 +2035,59 @@ impl App {
 
                 // -- how they are written
                 theme::form_row(ui, "Format", LABEL, |ui| {
-                    theme::check(ui, &mut self.semicolon, "Semikolon als Trennzeichen")
-                        .on_hover_text("Für Excel mit deutschem Dezimalkomma");
-                    ui.add_space(18.0);
+                    theme::form_cell(ui, FIRST, |ui| {
+                        theme::check(ui, &mut self.semicolon, "Semikolon als Trennzeichen")
+                            .on_hover_text("Für Excel mit deutschem Dezimalkomma");
+                    });
                     theme::check(ui, &mut self.shorten_names, "Tag-Namen kürzen")
                         .on_hover_text("Nur den Teil behalten, der die Tags unterscheidet");
                 });
                 if self.shorten_names {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add_space(LABEL + ui.spacing().item_spacing.x);
-                        match self.shorten_example() {
-                            Some((full, short)) => {
-                                ui.label(muted(full));
-                                ui.label(muted("wird zu"));
-                                ui.label(muted(short).color(TEXT));
+                    // Under the box it belongs to, in the second column.
+                    ui.horizontal(|ui| {
+                        ui.add_space(LABEL + FIRST + ui.spacing().item_spacing.x * 2.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            match self.shorten_example() {
+                                Some((full, short)) => {
+                                    ui.add(
+                                        egui::Label::new(muted(format!("Beispiel: {full}")))
+                                            .wrap(),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(muted(format!("wird zu  {short}"))
+                                            .color(TEXT))
+                                        .wrap(),
+                                    );
+                                }
+                                None => {
+                                    ui.label(muted(
+                                        "Für ein Beispiel eine Tag-Datenbank auswählen.",
+                                    ));
+                                }
                             }
-                            None => {
-                                ui.label(muted("Für ein Beispiel eine Tag-Datenbank auswählen."));
-                            }
-                        }
+                        });
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                 }
                 theme::divider(ui);
 
                 // -- where they go
                 theme::form_row(ui, "Speichern als", LABEL, |ui| {
-                    let mut name = self.base_name();
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut name)
-                                .desired_width(240.0)
-                                .margin(egui::vec2(8.0, 6.0)),
-                        )
-                        .on_hover_text("Der Teil vor _long.csv und _wide.csv")
-                        .changed()
-                    {
-                        self.base_name = Some(name);
-                    }
+                    theme::form_cell(ui, FIRST, |ui| {
+                        let mut name = self.base_name();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut name)
+                                    .desired_width(FIRST - 24.0)
+                                    .margin(egui::vec2(8.0, 6.0)),
+                            )
+                            .on_hover_text("Der Teil vor _long.csv und _wide.csv")
+                            .changed()
+                        {
+                            self.base_name = Some(name);
+                        }
+                    });
                     ui.label(hint("in"));
                     match self.chosen_dir() {
                         Some(dir) => {
@@ -2100,14 +2119,15 @@ impl App {
 
                 // -- how much goes into a chart
                 theme::form_row(ui, "Diagramm-Detail", LABEL, |ui| {
-                    let options: Vec<(Detail, &str, &str)> =
-                        [Detail::Light, Detail::Balanced, Detail::Full]
-                            .into_iter()
-                            .map(|d| (d, d.label(), d.describe()))
-                            .collect();
-                    theme::segmented(ui, &mut self.detail, &options);
-                    ui.add_space(8.0);
-                    ui.label(muted(self.detail.describe()));
+                    theme::form_cell(ui, FIRST, |ui| {
+                        let options: Vec<(Detail, &str, &str)> =
+                            [Detail::Light, Detail::Balanced, Detail::Full]
+                                .into_iter()
+                                .map(|d| (d, d.label(), d.describe()))
+                                .collect();
+                        theme::segmented(ui, &mut self.detail, &options);
+                    });
+                    ui.label(hint(self.detail.describe()));
                 });
             });
     }
